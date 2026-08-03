@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pm3-rs-python"
+version = "0.1.2"
+description = "PM3 semiempirical method (pm3-rs) with a Python-native API and an ASE calculator, including PM3-D3/D3H4/D3H4X corrections"
+readme = "README.md"
+license = { text = "GPL-3.0-or-later" }
+requires-python = ">=3.9"
+authors = [{ name = "ss0832" }]
+dependencies = ["numpy>=1.21"]
+
+[project.optional-dependencies]
+ase = ["ase>=3.22"]
+
+[tool.maturin]
+features = ["python"]
+python-source = "python"
+module-name = "pm3_rs._native"

@@ -1,0 +1,21 @@
+H4 hydrogen-bond and X halogen-bond corrections
+================================================
+
+Scientific references:
+
+  J. Rezac and P. Hobza, "Advanced Corrections of Hydrogen Bonding and
+  Dispersion for Semiempirical Quantum Mechanical Methods",
+  J. Chem. Theory Comput. 8, 141-151 (2012), DOI 10.1021/ct200751e.
+
+  J. Rezac and P. Hobza, "A halogen-bonding correction for the semiempirical
+  PM6 method", Chem. Phys. Lett. 506, 286-289 (2011),
+  DOI 10.1016/j.cplett.2011.03.009.
+
+The H4 functional form and PM3-specific coefficients were checked against the
+authors' public h_bonds4/Cuby interface. The coordinate-only implementation in
+pm3-rs includes the continuous water, ammonium, and carboxylate group scaling.
+PDB-residue-name-only HIP/GUA overrides are not applied because XYZ, Rust, and
+Python-native inputs carry no residue metadata.
+
+The X parameters were checked against open-source MOPAC v23.2.5
+src/corrections/disp_DnX.F90 (Apache-2.0).

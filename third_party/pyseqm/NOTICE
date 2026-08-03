@@ -1,0 +1,23 @@
+PySEQM — reference equations for the s/p two-center kernels
+===========================================================
+
+The closed-form s/p two-center two-electron integrals, the electron-core
+attraction terms, and the diatomic rotation to the local frame implemented in
+src/integrals.rs and src/overlap.rs follow the reference equations of:
+
+  PySEQM (PYthon Semi-Empirical Quantum Mechanics)
+  https://github.com/lanl/PYSEQM
+
+  G. Zhou, B. Nebgen, N. Lubbers, W. Malone, A. M. N. Niklasson, S. Tretiak,
+  "Graphics Processing Unit-Accelerated Semiempirical Born Oppenheimer
+   Molecular Dynamics Using PyTorch",
+  J. Chem. Theory Comput. 16, 4951-4962 (2020).
+
+PySEQM is distributed under the BSD 3-Clause License. No PySEQM source code is
+redistributed in this repository; the Rust implementation is original code that
+reproduces the same published NDDO working equations.
+
+ACTION REQUIRED BEFORE REDISTRIBUTION: if any PySEQM source is ever vendored
+into this repository, copy the verbatim LICENSE file (including its copyright
+line) from the upstream repository above into third_party/pyseqm/LICENSE, as
+BSD-3-Clause requires the copyright notice and license text to be retained.

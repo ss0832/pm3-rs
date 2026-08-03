@@ -1,0 +1,7 @@
+5
+methane geometry with one hydrogen replaced by the MOPAC Cb capped-bond atom
+C    0.000000   0.000000   0.000000
+Cb   0.627600   0.627600   0.627600
+H   -0.627600  -0.627600   0.627600
+H   -0.627600   0.627600  -0.627600
+H    0.627600  -0.627600  -0.627600

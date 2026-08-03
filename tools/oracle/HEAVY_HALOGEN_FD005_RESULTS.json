@@ -1,0 +1,66 @@
+{
+  "summary": {
+    "mopac_version": "23.2.5",
+    "hessian_source": "fd",
+    "fd_step_angstrom": 0.005,
+    "case_count": 3,
+    "successful_count": 3,
+    "error_count": 0,
+    "max_energy_abs_error_kcal": 4.306773819351406e-06,
+    "max_gradient_abs_error_ev_per_bohr": 3.2850974693188206e-05,
+    "max_hessian_abs_error_ev_per_bohr2": 0.004924488634192592
+  },
+  "results": [
+    {
+      "atom_code": 33,
+      "symbol": "As",
+      "kind": "element",
+      "name": "AsH3_z33",
+      "charge": 0,
+      "multiplicity": 1,
+      "natoms": 4,
+      "energy_mopac_kcal": 29.519946792022,
+      "energy_pm3_rs_kcal": 29.51994612,
+      "energy_abs_error_kcal": 6.720220007139233e-07,
+      "gradient_max_abs_error_ev_per_bohr": 2.3276443347430842e-05,
+      "hessian_max_abs_error_ev_per_bohr2": 0.004924488634192592,
+      "mopac_hessian_source": "fd",
+      "mopac_fd_step_angstrom": 0.005,
+      "status": "ok"
+    },
+    {
+      "atom_code": 35,
+      "symbol": "Br",
+      "kind": "element",
+      "name": "BrH1_z35",
+      "charge": 0,
+      "multiplicity": 1,
+      "natoms": 2,
+      "energy_mopac_kcal": 7.93544989322618,
+      "energy_pm3_rs_kcal": 7.9354542,
+      "energy_abs_error_kcal": 4.306773819351406e-06,
+      "gradient_max_abs_error_ev_per_bohr": 3.2850974693188206e-05,
+      "hessian_max_abs_error_ev_per_bohr2": 0.00141984303817555,
+      "mopac_hessian_source": "fd",
+      "mopac_fd_step_angstrom": 0.005,
+      "status": "ok"
+    },
+    {
+      "atom_code": 53,
+      "symbol": "I",
+      "kind": "element",
+      "name": "IH1_z53",
+      "charge": 0,
+      "multiplicity": 1,
+      "natoms": 2,
+      "energy_mopac_kcal": 32.0737061335822,
+      "energy_pm3_rs_kcal": 32.07370351,
+      "energy_abs_error_kcal": 2.6235821977138585e-06,
+      "gradient_max_abs_error_ev_per_bohr": 8.322491338974558e-06,
+      "hessian_max_abs_error_ev_per_bohr2": 0.00037216704902220954,
+      "mopac_hessian_source": "fd",
+      "mopac_fd_step_angstrom": 0.005,
+      "status": "ok"
+    }
+  ]
+}

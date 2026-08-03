@@ -1,0 +1,18 @@
+Grimme D3 dispersion — reference data and algorithm
+====================================================
+
+The D3 dispersion model, its C6 reference table (src/data/d3_c6_reference.csv),
+the cutoff radii r0ab (src/data/d3_r0ab.csv) and the per-element r2r4/rcov
+(src/data/d3_radii.csv) originate from:
+
+  S. Grimme, J. Antony, S. Ehrlich, H. Krieg,
+  "A consistent and accurate ab initio parametrization of density functional
+   dispersion correction (DFT-D) for the 94 elements H-Pu",
+  J. Chem. Phys. 132, 154104 (2010).
+
+They were extracted (tools/extract_d3_data.py) from MOPAC v23.2.5
+(github.com/openmopac/mopac, tag v23.2.5, Apache-2.0), whose
+src/corrections/{dftd3.F90, dftd3_bits.F90, copyc6.F90} were "derived and
+adapted from the DFTD3 library" with the permission of Stephan Grimme (see
+MOPAC's src/corrections/README.md). The numeric reference values are published
+scientific constants.
