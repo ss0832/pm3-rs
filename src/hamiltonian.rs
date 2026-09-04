@@ -75,6 +75,45 @@ pub fn pair_cache_bytes(basis: &Basis) -> usize {
 /// The very large Cb resonance integral is retained in the SCF Fock matrix so
 /// it terminates the dangling bond, but MOPAC `capcor` removes its contribution
 /// from the reported electronic energy after the density has converged.
+/// [`capped_bond_energy_correction`] from a sparse density and core.
+///
+/// Every term is a product `P_{μν} H_{μν}`, so wherever the divide-and-conquer density is
+/// structurally zero the term is zero whatever the core holds there. That is what lets both
+/// sides be read on the pattern and still give the dense answer exactly.
+pub(crate) fn capped_bond_energy_correction_sparse(
+    molecule: &Molecule,
+    basis: &Basis,
+    pattern: &crate::dc::pattern::DensityPattern,
+    density: &crate::dc::pattern::SparseMatrix,
+    h_core: &crate::dc::pattern::SparseMatrix,
+) -> f64 {
+    let mut sum = 0.0;
+    for i in 0..molecule.atoms.len() {
+        let il = basis.atom_offset[i];
+        let iu = il + basis.atom_norb[i];
+        if molecule.atoms[i].z == 102 {
+            if iu == 0 {
+                continue;
+            }
+            let last = iu - 1;
+            for k in 0..last {
+                sum += density.get(pattern, last, k) * h_core.get(pattern, last, k);
+            }
+        } else {
+            for j in 0..=i {
+                if molecule.atoms[j].z != 102 {
+                    continue;
+                }
+                let capped_s = basis.atom_offset[j];
+                for k in il..iu {
+                    sum += density.get(pattern, k, capped_s) * h_core.get(pattern, k, capped_s);
+                }
+            }
+        }
+    }
+    -2.0 * sum
+}
+
 pub(crate) fn capped_bond_energy_correction(
     molecule: &Molecule,
     basis: &Basis,
@@ -131,22 +170,30 @@ fn embed4(s: [[f64; 4]; 4]) -> [[f64; 9]; 9] {
     out
 }
 
-/// [`build_core_limited`] with the process-wide default cache ceiling.
+/// [`build_core_limited`] with the process-wide default cache ceiling and **no external field**.
 pub fn build_core(
     molecule: &Molecule,
     basis: &Basis,
     params: &Pm3Parameters,
 ) -> Result<CoreHamiltonian> {
-    build_core_limited(molecule, basis, params, default_pair_cache_limit_mb())
+    build_core_limited(molecule, basis, params, default_pair_cache_limit_mb(), None)
 }
 
 /// Assemble `H_core` and the resident two-electron pair cache, refusing to
 /// start if the cache would exceed `limit_mb` MiB (`0` = unlimited).
+///
+/// `field` is a uniform external electric field (eV per Bohr per elementary charge), which
+/// enters here rather than being added by the caller afterwards. That is deliberate: the field
+/// is a one-electron operator, so it belongs in `H_core`, and every consumer — the SCF, the
+/// fixed-density energy, the Hessian's derivative Fock — then sees it without having to
+/// remember to. Making it an argument rather than a later mutation means the compiler asks each
+/// call site the question instead of letting one of them silently answer "no field".
 pub fn build_core_limited(
     molecule: &Molecule,
     basis: &Basis,
     params: &Pm3Parameters,
     limit_mb: usize,
+    field: Option<crate::math::Vec3>,
 ) -> Result<CoreHamiltonian> {
     let nao = basis.nao;
     // Pre-flight guard: the pair cache is the single largest allocation of a
@@ -172,6 +219,17 @@ pub fn build_core_limited(
             1..=3 => elem.u_pp,
             _ => elem.u_dd,
         };
+    }
+
+    // The external field, as `+M·f` — the same dipole operator the reported dipole is an
+    // expectation value of. It is added before the two-center terms because those use `=` on the
+    // resonance block and would overwrite it; the one-center loop above uses `=` for the same
+    // reason and this has to follow it.
+    if let Some(f) = field {
+        let (operator, _) = crate::dipole::field_terms(molecule, params, basis, f)?;
+        for (slot, value) in h.as_mut_slice().iter_mut().zip(operator.as_slice()) {
+            *slot += value;
+        }
     }
 
     use rayon::prelude::*;

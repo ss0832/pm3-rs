@@ -99,6 +99,12 @@ pub fn analytic_gradient(
         }
     }
 
+    // The field's own term. `electronic_energy_at_fixed_density` builds its core Hamiltonian
+    // without a field — deliberately, that being also the skeleton path — so displacing an atom
+    // above never moved `−f·r`, and the whole of `−q_A f` would be missing here while
+    // [`closed_form_gradient`] beside it had it.
+    add_field_gradient(options, &scf, &mut gradient);
+
     let forces: Vec<Vec3> = gradient.iter().map(|g| *g * -1.0).collect();
     let max_gradient = gradient
         .iter()
@@ -237,6 +243,7 @@ fn closed_form_gradient_core(
         let energy_ev = scf.total_ev;
         let mut gradient = fixed_density_gradient_uhf(molecule, params, &scf)?;
         add_correction_gradient(molecule, options.variant, &mut gradient);
+        add_field_gradient(options, &scf, &mut gradient);
         let forces: Vec<Vec3> = gradient.iter().map(|g| *g * -1.0).collect();
         let max_gradient = gradient
             .iter()
@@ -253,6 +260,7 @@ fn closed_form_gradient_core(
     let energy_ev = scf.total_ev;
     let mut gradient = fixed_density_gradient(molecule, params, &scf.density)?;
     add_correction_gradient(molecule, options.variant, &mut gradient);
+    add_field_gradient(options, &scf, &mut gradient);
     let forces: Vec<Vec3> = gradient.iter().map(|g| *g * -1.0).collect();
     let max_gradient = gradient
         .iter()
@@ -265,6 +273,31 @@ fn closed_form_gradient_core(
         forces,
         max_gradient,
     })
+}
+
+/// The external field's contribution to the gradient: `−q_A f`, a net atomic charge pulled by
+/// the field.
+///
+/// With `E_field = −μ·f` and `μ_β = Σ_A Z_A R_{A,β} − Tr[P M_β]`, the explicit derivative at
+/// fixed density is
+///
+/// ```text
+/// ∂μ_β/∂R_{A,α} = (Z_A − pop_A) δ_αβ = q_A δ_αβ   ⇒   ∂E_field/∂R_{A,α} = −q_A f_α
+/// ```
+///
+/// so the force on the atom is `+q_A f`, the classical one. The minus sign here is on the
+/// *gradient*; getting it backwards is a sign error that still produces plausible forces of the
+/// right magnitude, which is why this is checked against a finite difference rather than read.
+///
+/// This is a **one-center** term, and the first one PM3 has: nothing else in the energy depends
+/// on a single atom's position, which is why [`fixed_density_gradient`] is a pure pair loop with
+/// nothing to hook into. Everything else — how the density rearranges — is Hellmann–Feynman and
+/// already carried by the converged density.
+fn add_field_gradient(options: &Pm3Options, scf: &Pm3Result, gradient: &mut [Vec3]) {
+    let Some(field) = options.field else { return };
+    for (slot, charge) in gradient.iter_mut().zip(&scf.charges) {
+        *slot -= field * *charge;
+    }
 }
 
 /// Total closed-form gradient (core-core + electronic) at an **arbitrary fixed density** `p`
@@ -288,7 +321,7 @@ pub fn fixed_density_gradient(
 /// Add the **analytic** D3/H4/X correction gradient into `gradient` (eV/Bohr): forward-mode AD
 /// ([`crate::dual::Dual`]) of the scalar-generic correction energy — no finite differences, no
 /// SCF. One evaluation per atom (seed that atom's `x,y,z`).
-fn add_correction_gradient(
+pub(crate) fn add_correction_gradient(
     molecule: &Molecule,
     variant: crate::corrections::Variant,
     gradient: &mut [Vec3],
@@ -720,5 +753,71 @@ mod tests {
         eprintln!("UHF closed-form-vs-numerical gradient max delta = {max_delta:.3e}");
         assert!(max_delta < 5.0e-5, "UHF gradient mismatch {max_delta:.3e}");
         assert!(cf.max_gradient > 1.0e-2);
+    }
+    /// The analytic gradient in a field, against a finite difference of the energy.
+    ///
+    /// The field's own term is `Q_A f`, and the fact that it is a *one-center* term is the
+    /// reason it needs its own hook: `fixed_density_gradient` is a pure pair loop, because
+    /// nothing else in PM3 depends on a single atom's position. A field is the first thing that
+    /// does, so there was no existing loop to add it to and no chance of it being picked up by
+    /// accident.
+    #[test]
+    fn the_gradient_in_a_field_matches_finite_differences() {
+        let params = Pm3Parameters::standard().unwrap();
+        let molecule = Molecule::from_xyz_str(
+            "3\nwater\nO 0.0 0.0 0.1173\nH 0.0 0.7572 -0.4692\nH 0.0 -0.7572 -0.4692\n",
+            0.0,
+        )
+        .unwrap();
+        let field = crate::math::Vec3::new(0.02, -0.013, 0.031);
+        let options = Pm3Options {
+            e_tol: 1.0e-12,
+            p_tol: 1.0e-11,
+            field: Some(field),
+            ..Default::default()
+        };
+
+        let analytic = closed_form_gradient(&molecule, &params, &options).unwrap();
+        let step = 1.0e-4;
+        for atom in 0..molecule.atoms.len() {
+            for axis in 0..3 {
+                let energy_at = |sign: f64| {
+                    let mut shifted = molecule.clone();
+                    let mut delta = [0.0; 3];
+                    delta[axis] = sign * step;
+                    shifted.atoms[atom].position +=
+                        crate::math::Vec3::new(delta[0], delta[1], delta[2]);
+                    run_pm3(&shifted, &params, &options).unwrap().total_ev
+                };
+                let numeric = (energy_at(1.0) - energy_at(-1.0)) / (2.0 * step);
+                let got = analytic.gradient[atom].to_array()[axis];
+                assert!(
+                    (got - numeric).abs() < 2.0e-6,
+                    "atom {atom} axis {axis}: analytic {got}, finite difference {numeric}"
+                );
+            }
+        }
+
+        // The field genuinely changed the forces, so the agreement above is not agreement on
+        // the field-free answer.
+        let without = closed_form_gradient(
+            &molecule,
+            &params,
+            &Pm3Options {
+                field: None,
+                ..options.clone()
+            },
+        )
+        .unwrap();
+        let moved: f64 = analytic
+            .gradient
+            .iter()
+            .zip(&without.gradient)
+            .map(|(a, b)| (*a - *b).norm())
+            .sum();
+        assert!(
+            moved > 1.0e-3,
+            "the field barely moved the gradient ({moved})"
+        );
     }
 }

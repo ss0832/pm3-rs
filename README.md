@@ -1,8 +1,8 @@
 # pm3-rs
 
-`pm3-rs` is a Rust implementation of the molecular PM3 semiempirical NDDO
-method (Stewart 1989), with the PM3 Hamiltonian, the MOPAC v23.2.5 PM3
-parameter tables, and the PM3 core-core repulsion.
+`pm3-rs` is a Rust implementation of the PM3 semiempirical NDDO method
+(Stewart 1989), with the PM3 Hamiltonian, the MOPAC v23.2.5 PM3 parameter
+tables, and the PM3 core-core repulsion — for molecules and for periodic solids.
 
 The project provides:
 
@@ -11,7 +11,33 @@ The project provides:
 - L-BFGS geometry optimization and harmonic frequencies
 - PM3-D3, PM3-D3H4, and PM3-D3H4X post-SCF variants
 - MOPAC special atoms: `Cb` (capped bond), `+`, `-`, and La-Lu Sparkles
-- Rust library/CLI plus the `pm3-rs-python` native and ASE Python package
+- a **uniform external electric field** (molecular): energy, analytic gradient
+  and analytic Hessian, RHF and UHF
+- **infrared intensities**, and **Molden** output of the orbitals
+- **periodic boundary conditions** in 1D, 2D and 3D — Ewald electrostatics,
+  Γ-point and k-point SCF, analytic forces, analytic stress in every periodic
+  dimensionality, Γ-point phonons, charged cells, and lattice-summed
+  corrections ([`docs/pbc.md`](docs/pbc.md))
+- the **dynamical matrix at arbitrary `q`**, from the primitive cell, with the
+  electronic response — over a k-mesh or at Γ alone;
+  `rigid_ion_dynamical_matrix` gives the fixed-density part by itself
+  ([`docs/pbc.md`](docs/pbc.md))
+- **Born effective charges**, the **electronic and static dielectric tensors**
+  (`ε∞` and `ε₀`), **LO–TO splitting**, and **supercell phonon dispersion** —
+  all contractions of that same response ([`docs/pbc.md`](docs/pbc.md))
+- **Berry-phase polarization**, present as an independent check on the charges
+  above rather than as a feature in itself, and a **finite electric field along
+  a periodic direction** built on it (the Nunes–Gonze electric enthalpy), where
+  the ordinary `−𝓔·r` coupling has no ground state to find
+- the **Mermin electronic free energy** `E − TS` under Fermi smearing, which is
+  what ASE's `free_energy` and `force_consistent=True` mean — and which is *not*
+  a Gibbs free energy: no zero-point energy, no vibrational partition function,
+  no `pV`, no nuclear entropy
+- **divide-and-conquer** partitioned SCF, molecular and periodic, with an
+  optional linear-scaling near field
+  ([`docs/divide-and-conquer.md`](docs/divide-and-conquer.md))
+- Rust library plus the `pm3-rs-python` native and ASE Python package, and one
+  `pm3-rs` command that `pip install` and `cargo install` both put on your path
 
 Linear algebra uses `faer`; no external BLAS/LAPACK installation is required.
 
@@ -70,15 +96,18 @@ maturin develop --release --features python
 python -m pytest tests/test_python.py tests/test_python_api.py
 ```
 
-The binary is named `pm3_rs_cli`:
+A `pip install` puts a `pm3-rs` command on your path; a `cargo build` produces
+the same interface as a binary named `pm3_rs_cli`. They are the same compiled
+implementation — the Python entry point hands `sys.argv` straight to it — so
+neither can drift from the other.
 
 ```sh
-pm3_rs_cli energy water.xyz
-pm3_rs_cli gradient water.xyz
-pm3_rs_cli optimize water.xyz
-pm3_rs_cli frequencies water.pm3opt.xyz
-pm3_rs_cli charges water.xyz --charge 0 --multiplicity 1
-pm3_rs_cli energy dimer.xyz --method PM3-D3H4X
+pm3-rs energy water.xyz
+pm3-rs gradient water.xyz
+pm3-rs optimize water.xyz
+pm3-rs frequencies water.pm3opt.xyz
+pm3-rs charges water.xyz --charge 0 --multiplicity 1
+pm3-rs energy dimer.xyz --method PM3-D3H4X
 ```
 
 ## Rust API
@@ -125,6 +154,43 @@ atoms.calc = PM3(method="pm3-d3h4")
 print(atoms.get_potential_energy())
 print(atoms.get_forces())
 ```
+
+## Periodic boundary conditions
+
+```bash
+pm3-rs energy  crystal.xyz --cell 10.0                 # Gamma point
+pm3-rs energy  crystal.xyz --cell 6.5 --kpts 4,4,4     # 4x4x4 mesh
+pm3-rs stress  crystal.xyz --cell 10.0
+pm3-rs phonons crystal.xyz --cell 10.0                 # Gamma point
+pm3-rs phonons crystal.xyz --cell 10.0 --q 0.25,0,0    # DFPT at a wavevector
+pm3-rs phonon-bands crystal.xyz --cell 6.0 --supercell 2,2,2   # dispersion
+pm3-rs born   crystal.xyz --cell 6.0                   # Born effective charges
+pm3-rs dielectric crystal.xyz --cell 6.0 --static      # eps_inf and eps_0
+pm3-rs berry  crystal.xyz --cell 6.0                   # Berry-phase polarization
+pm3-rs finite-field crystal.xyz --cell 6.0 --field 0.001,0,0 --kpts 6,1,1
+pm3-rs energy  big.xyz --dc 5.0                        # divide and conquer
+```
+
+```python
+from ase import Atoms
+from pm3_rs.ase import PM3
+
+atoms.set_cell([10.0, 10.0, 10.0])
+atoms.set_pbc(True)
+atoms.calc = PM3()                    # or PM3(kpts=(4, 4, 4))
+atoms.get_potential_energy()          # eV per cell
+atoms.get_stress()                    # (6,) Voigt, eV/A^3
+atoms.calc.get_born_charges(atoms)    # Z*, with its sum-rule residual
+atoms.calc.get_dielectric(atoms, include_ionic=True)   # eps_inf and eps_0
+```
+
+> **One caveat worth reading before trusting a Γ-point number.** A single
+> k-point substitutes `P(Γ)` for `P(0, T)` at *every* image, which is exact only
+> when no image lies inside the exchange range. A cell one Bohr too narrow
+> converges cleanly, in the usual number of iterations, to an answer wrong by
+> tens of eV — nothing in the SCF reacts. Every periodic result reports a
+> `gamma_margin`; it must be positive, or you need `--kpts` or a larger
+> supercell. See [`docs/pbc.md`](docs/pbc.md).
 
 ## Units
 

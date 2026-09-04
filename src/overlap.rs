@@ -284,6 +284,26 @@ fn overlap_locals<S: Scalar>(ea: &Pm3Element, eb: &Pm3Element, r: S) -> Result<[
     let za = [ea.zeta_s, ea.zeta_p];
     let zb = [eb.zeta_s, eb.zeta_p];
 
+    // Beyond this separation the overlap has underflowed and the auxiliary integrals have not.
+    //
+    // `A_k` carries `e^{−r(ζ_a+ζ_b)/2}` and `B_k` carries `e^{+r|ζ_a−ζ_b|/2}`; the overlap is
+    // their product, which is tiny, but the two factors separately are `0` and `∞`. For an O–H
+    // pair the `B` term overflows past about 500 Bohr, and `0 · ∞` is a NaN that then propagates
+    // silently through `H_core` — visible only as an energy that will not converge, in a system
+    // large enough to contain a 500 Bohr separation at all.
+    //
+    // The cut is placed where the decaying factor alone is below `1e-130`: no overlap that could
+    // matter to any calculation is affected, and none of the frozen MOPAC comparisons move.
+    const UNDERFLOW_EXPONENT: f64 = 300.0;
+    let smallest_sum = 0.5
+        * [za[0] + zb[0], za[1] + zb[0], za[0] + zb[1], za[1] + zb[1]]
+            .into_iter()
+            .filter(|sum| *sum > 0.0)
+            .fold(f64::INFINITY, f64::min);
+    if smallest_sum.is_finite() && r.val() * smallest_sum > UNDERFLOW_EXPONENT {
+        return Ok([S::cst(0.0); 5]);
+    }
+
     // A/B auxiliary integrals for each (zeta_a-shell, zeta_b-shell) pair.
     let a111 = aintgs(r * (0.5 * (za[0] + zb[0])));
     let b111 = bintgs(r * (0.5 * (za[0] - zb[0])));
@@ -530,6 +550,107 @@ mod tests {
     use super::*;
     use crate::params::Pm3Parameters;
 
+    /// The `B` integrals must be continuous, and correctly differentiable, across both branch
+    /// boundaries.
+    ///
+    /// A branch on `|x|` is where a ported numerical workaround goes wrong quietly: the value
+    /// can step by less than any tolerance anyone would think to apply, while the *derivative*
+    /// jumps by an amount that shows up only as a force that will not integrate. Both are
+    /// checked here, on both sides of `0.5` and of `1e-6`, against the function itself.
+    #[test]
+    fn the_b_integrals_are_smooth_across_their_branches() {
+        // `B_k(x) = ∫₋₁¹ tᵏ e^{−xt} dt`, by composite Simpson on a smooth integrand. Comparing
+        // against the definition rather than against the neighbouring branch is what makes this
+        // a test of the values and not of the function's own slope: two branches evaluated at
+        // two nearby points differ by the derivative times the gap whether or not there is a
+        // step, which is a mistake worth not making twice.
+        let reference = |k: usize, x: f64| -> f64 {
+            const PANELS: usize = 20_000;
+            let h = 2.0 / PANELS as f64;
+            let f = |t: f64| t.powi(k as i32) * (-x * t).exp();
+            let mut sum = f(-1.0) + f(1.0);
+            for i in 1..PANELS {
+                let t = -1.0 + h * i as f64;
+                sum += f(t) * if i % 2 == 0 { 2.0 } else { 4.0 };
+            }
+            sum * h / 3.0
+        };
+
+        // Straddling both branch boundaries — 0.5, where the closed form takes over from the
+        // power series, and 1e-6, where the series gives way to the x → 0 limits.
+        for x in [
+            -2.0_f64, -0.51, -0.49, -1.0e-3, -1.0e-7, 0.0, 1.0e-7, 1.0e-3, 0.49, 0.51, 2.0,
+        ] {
+            let got = bintgs::<f64>(x);
+            for (k, value) in got.iter().enumerate() {
+                let want = reference(k, x);
+                // The tolerance is the *reference's* accuracy, not `bintgs`'s: Simpson on
+                // `t¹² e^{−xt}` is the less exact of the two, and tightening past this measures
+                // the quadrature rather than the thing under test.
+                assert!(
+                    (value - want).abs() < 1.0e-8 * want.abs().max(1.0),
+                    "B_{k}({x}) = {value} but the integral is {want}"
+                );
+            }
+        }
+
+        // And the derivative the differentiating path reports is the derivative of the value the
+        // plain path returns — everywhere, including inside the small-`x` branch, where the
+        // returned constants correctly carry a zero derivative.
+        for x in [
+            -2.0_f64, -0.6, -0.49, -1.0e-3, -1.0e-7, 1.0e-7, 1.0e-3, 0.49, 0.6, 2.0,
+        ] {
+            let analytic = bintgs(crate::dual::Dual::var(x, 0));
+            let h = (x.abs() * 1.0e-6).max(1.0e-9);
+            let plus = bintgs::<f64>(x + h);
+            let minus = bintgs::<f64>(x - h);
+            for k in 0..13 {
+                let numeric = (plus[k] - minus[k]) / (2.0 * h);
+                let got = analytic[k].d[0];
+                assert!(
+                    (got - numeric).abs() < 1.0e-4 * numeric.abs().max(1.0),
+                    "dB_{k}/dx at x = {x}: analytic {got} vs numeric {numeric}"
+                );
+            }
+        }
+    }
+
+    /// The rotation onto the interatomic axis switches branches at `v_x = 0`, and must not step
+    /// there.
+    ///
+    /// The two branches are not the same kind of object — a quaternion rotation on one side, a
+    /// Householder *reflection* on the other — and each exists because the other is
+    /// ill-conditioned in its half. Whether the seam is smooth is not obvious from either
+    /// formula, and a step in it would move every two-centre integral whose axis happens to
+    /// point that way.
+    #[test]
+    fn the_frame_rotation_does_not_step_where_it_changes_branch() {
+        for (y, z) in [(1.0_f64, 0.0_f64), (0.0, 1.0), (0.6, 0.8), (-0.3, 0.95)] {
+            let norm = (y * y + z * z).sqrt();
+            for epsilon in [1.0e-9_f64, 1.0e-7, 1.0e-5] {
+                let unit = |vx: f64| {
+                    let scale = ((1.0 - vx * vx).max(0.0)).sqrt() / norm;
+                    crate::integrals::rotation_to_x(Vec3::new(vx, y * scale, z * scale))
+                };
+                let below = unit(-epsilon);
+                let above = unit(epsilon);
+                for row in 0..3 {
+                    for column in 0..3 {
+                        // A reflection and a rotation that both take `v` onto `+x` can differ by
+                        // the sign of the frame, so compare what the integrals actually use: the
+                        // axis each row defines, up to that sign.
+                        let jump = (below[row][column].abs() - above[row][column].abs()).abs();
+                        assert!(
+                            jump < 1.0e-4,
+                            "rotation[{row}][{column}] steps by {jump:.3e} across v_x = 0 \
+                             at ±{epsilon}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn numeric_reproduces_analytic_overlap() {
         // The general numerical overlap must match the MOPAC-validated analytic kernel for
@@ -654,10 +775,51 @@ fn aintgs<S: Scalar>(x: S) -> [S; 13] {
 
 /// B auxiliary integrals `B_k(x) = ∫₋₁^¹ t^k e^{-xt} dt`, returned as `[B_0 … B_12]`.
 /// Generic over the scalar type so the radial (`x ∝ r`) dependence differentiates exactly.
+///
+/// # Two branches where MOPAC has three
+///
+/// The closed form `B_k = ±e^{x}/x − e^{−x}/x + (k/x) B_{k−1}` is exact and unusable near
+/// `x = 0`: it is `0/0` there, and its recursion multiplies whatever cancellation survives by
+/// `k/|x|` at every step. MOPAC answers with a six-term power series below `|x| = 0.5` and with
+/// the `x → 0` limits below `1e-6`.
+///
+/// Those thresholds leave a gap. Just *above* `0.5` the recursion is still amplifying by about
+/// two per index, and by `B₁₂` it has lost seven digits — measured at `x = −0.51` as a relative
+/// error of `5e-7` in `B₉` against the integral itself. And the `x → 0` branch returns
+/// **constants**, so a differentiating scalar gets a zero derivative where `dB₁/dx = −2/3`.
+///
+/// Both go away by summing the series that defines the thing:
+///
+/// ```text
+/// B_k(x) = Σ_m (−x)^m/m! ∫₋₁¹ t^{k+m} dt = 2 Σ_{k+m even} (−x)^m / (m! (k+m+1))
+/// ```
+///
+/// Absolutely convergent, every term independent of every other, so nothing amplifies anything;
+/// exact at `x = 0`, including its derivative; and it costs a few dozen multiplies. Carrying it
+/// out to `|x| = 3` covers the whole unstable region, and past that `k/|x| ≤ 4` with terms that
+/// no longer cancel. The `x → 0` special case disappears entirely rather than being widened.
+///
+/// [`tests::the_b_integrals_are_smooth_across_their_branches`] pins this against the integral,
+/// on both sides of the remaining seam, and pins the derivative against the values.
+///
+/// The frozen MOPAC comparisons are unmoved: the change is an accuracy improvement of well under
+/// their tolerances, in a direction that is toward the true value rather than away from it.
+/// Where the directly summed series takes over from the closed-form recursion.
+///
+/// The recursion `b[i] = ±e^{x}/x − e^{−x}/x + b[i−1]·(i/x)` amplifies whatever cancellation it
+/// starts with by `i/|x|` at every step, so just above MOPAC's own `0.5` threshold it multiplies
+/// by about two per index and has lost seven digits by `B₁₂` — measured, at `x = −0.51`, as a
+/// relative error of `5e-7` in `B₉` against the integral itself. Pushing the series out to `3`
+/// covers the whole unstable region; beyond that `i/|x| ≤ 4` and the terms no longer cancel.
+const SERIES_RANGE: f64 = 3.0;
+
+/// Terms kept in the series. `x^m/m!` at `|x| = 3` is below `1e-17` by `m = 30`.
+const SERIES_TERMS: usize = 40;
+
 fn bintgs<S: Scalar>(x: S) -> [S; 13] {
     let mut b = [S::cst(0.0); 13];
     let absx = x.val().abs();
-    if absx > 0.5 {
+    if absx > SERIES_RANGE {
         let inv = x.recip();
         let tx = x.exp() * inv;
         let tmx = (-x).exp() * inv * (-1.0);
@@ -666,35 +828,22 @@ fn bintgs<S: Scalar>(x: S) -> [S; 13] {
             let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
             b[i] = tx * sign + tmx + b[i - 1] * inv * (i as f64);
         }
-    } else if absx > 1.0e-6 {
-        let x2 = x * x;
-        let x3 = x2 * x;
-        let x4 = x2 * x2;
-        let x5 = x4 * x;
-        let x6 = x4 * x2;
-        // even index (b1,b3,...): power series in x²
-        b[0] = x2 * (1.0 / 3.0) + x4 * (1.0 / 60.0) + x6 * (1.0 / 2520.0) + 2.0;
-        b[2] = x2 * (1.0 / 5.0) + x4 * (1.0 / 84.0) + x6 * (1.0 / 3240.0) + 2.0 / 3.0;
-        b[4] = x2 * (1.0 / 7.0) + x4 * (1.0 / 108.0) + x6 * (1.0 / 3960.0) + 2.0 / 5.0;
-        b[6] = x2 * (1.0 / 9.0) + x4 * (1.0 / 132.0) + x6 * (1.0 / 4680.0) + 2.0 / 7.0;
-        b[8] = x2 * (1.0 / 11.0) + x4 * (1.0 / 156.0) + x6 * (1.0 / 5400.0) + 2.0 / 9.0;
-        b[10] = x2 * (1.0 / 13.0) + x4 * (1.0 / 180.0) + x6 * (1.0 / 6120.0) + 2.0 / 11.0;
-        b[12] = x2 * (1.0 / 15.0) + x4 * (1.0 / 204.0) + x6 * (1.0 / 6840.0) + 2.0 / 13.0;
-        // odd index (b2,b4,...): power series in x
-        b[1] = x * (-2.0 / 3.0) - x3 * (1.0 / 15.0) - x5 * (1.0 / 420.0);
-        b[3] = x * (-2.0 / 5.0) - x3 * (1.0 / 21.0) - x5 * (1.0 / 540.0);
-        b[5] = x * (-2.0 / 7.0) - x3 * (1.0 / 27.0) - x5 * (1.0 / 660.0);
-        b[7] = x * (-2.0 / 9.0) - x3 * (1.0 / 33.0) - x5 * (1.0 / 780.0);
-        b[9] = x * (-2.0 / 11.0) - x3 * (1.0 / 39.0) - x5 * (1.0 / 900.0);
-        b[11] = x * (-2.0 / 13.0) - x3 * (1.0 / 45.0) - x5 * (1.0 / 1020.0);
     } else {
-        // x ≈ 0
-        for (i, bi) in b.iter_mut().enumerate() {
-            *bi = S::cst(if i % 2 == 0 {
-                2.0 / (i as f64 + 1.0)
-            } else {
-                0.0
-            });
+        // Expanding `e^{−xt}` under the integral and integrating term by term,
+        //
+        //     B_k(x) = Σ_m (−x)^m/m! ∫₋₁¹ t^{k+m} dt = 2 Σ_{k+m even} (−x)^m / (m! (k+m+1))
+        //
+        // Every term is computed independently, so nothing amplifies anything: the sum is
+        // absolutely convergent, the terms fall like `x^m/m!`, and thirty of them are already
+        // below the last bit for any `|x|` this branch sees.
+        let mut term = S::cst(1.0); // (−x)^m / m!
+        for m in 0..SERIES_TERMS {
+            for (k, slot) in b.iter_mut().enumerate() {
+                if (k + m) % 2 == 0 {
+                    *slot = *slot + term * (2.0 / (k + m + 1) as f64);
+                }
+            }
+            term = term * (-x) * (1.0 / (m + 1) as f64);
         }
     }
     b

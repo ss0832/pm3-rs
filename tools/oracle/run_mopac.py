@@ -186,7 +186,23 @@ def run(
         "energy_nuclear_ev": aux.get("ENERGY_NUCLEAR"),
         "total_energy_ev": aux.get("TOTAL_ENERGY"),
         "dipole_debye": aux.get("DIP_VEC"),
+        "dipole_magnitude_debye": aux.get("DIPOLE"),
         "charges": aux.get("ATOM_CHARGES"),
+        # Density-derived quantities. Energies, gradients and Hessians can all
+        # agree while the density itself is subtly wrong (a misplaced one-center
+        # term cancels in the energy expression but not in the populations), so
+        # the reproduction audit compares these too.
+        "eigenvalues_ev": aux.get("EIGENVALUES"),
+        # MOPAC does not necessarily print every eigenvalue: SET_OF_MOS gives the
+        # inclusive 1-based index window that EIGENVALUES actually covers (for a
+        # Sparkle complex it drops the deepest levels). Comparing the raw list
+        # against a full set of MOs silently skips those cases, so the window
+        # travels with the eigenvalues.
+        "set_of_mos": aux.get("SET_OF_MOS"),
+        "mo_occupancies": aux.get("MOLECULAR_ORBITAL_OCCUPANCIES"),
+        "num_electrons": aux.get("NUM_ELECTRONS"),
+        "ionization_potential_ev": aux.get("IONIZATION_POTENTIAL"),
+        "scf_cycles": aux.get("NUMBER_SCF_CYCLES"),
         "gradients_kcal_mol_ang": aux.get("GRADIENTS"),
         "frequencies_cm": aux.get("VIB._FREQ"),
         "hessian_ev_per_bohr2": parse_cartesian_hessian(aux_path, aux),

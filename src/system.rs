@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Molecular geometry and XYZ I/O (the periodic-cell machinery of the parent
-//! prototypes is removed — PM3 here is a molecular method).
+//! Atomic geometry and XYZ I/O, for both molecules and periodic systems.
 //!
 //! Positions are stored in **Bohr** internally. `from_xyz_*` reads Ångström by
 //! default (the XYZ convention) and converts on input.
+//!
+//! A [`Molecule`] carries an optional [`Cell`]. `cell = None` is the molecular case and
+//! takes exactly the code path it always did; `Some(cell)` makes the same structure
+//! periodic in 1, 2 or 3 directions. Keeping one type — rather than a separate periodic
+//! one — is what lets the neighbour list, the classical corrections and the derivative
+//! machinery serve both cases from a single implementation.
 
+use crate::cell::Cell;
 use crate::constants::ANGSTROM_TO_BOHR;
 use crate::error::{Pm3Error, Result};
 use crate::math::Vec3;
@@ -19,13 +25,18 @@ pub struct Atom {
     pub position: Vec3,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Molecule {
     pub atoms: Vec<Atom>,
-    /// Total molecular charge (electrons removed = positive).
+    /// Total charge (electrons removed = positive). For a periodic system this is the
+    /// net charge **per unit cell**; a non-zero value is neutralized by a uniform
+    /// background in the Ewald sum, which makes the absolute energy convention-dependent.
     pub charge: f64,
     /// Spin multiplicity (2S+1). 1 = closed-shell singlet.
     pub multiplicity: usize,
+    /// Periodic cell, or `None` for a molecule. `None` reproduces the molecular path
+    /// exactly; the periodic path is selected purely by this field being present.
+    pub cell: Option<Cell>,
 }
 
 impl Molecule {
@@ -34,6 +45,7 @@ impl Molecule {
             atoms,
             charge: 0.0,
             multiplicity: 1,
+            cell: None,
         }
     }
 
@@ -45,6 +57,17 @@ impl Molecule {
     pub fn with_multiplicity(mut self, multiplicity: usize) -> Self {
         self.multiplicity = multiplicity.max(1);
         self
+    }
+
+    /// Make the structure periodic in the directions `cell` marks as periodic.
+    pub fn with_cell(mut self, cell: Cell) -> Self {
+        self.cell = Some(cell);
+        self
+    }
+
+    /// `true` when this structure is periodic in at least one direction.
+    pub fn is_periodic(&self) -> bool {
+        self.cell.is_some_and(|c| c.n_periodic() > 0)
     }
 
     pub fn len(&self) -> usize {
@@ -65,7 +88,10 @@ impl Molecule {
 
     /// Parse a standard XYZ block. Coordinates are Ångström and converted to Bohr.
     pub fn from_xyz_str(text: &str, charge: f64) -> Result<Self> {
-        let mut lines = text.lines();
+        // Windows text editors and PowerShell's `-Encoding utf8` both start a UTF-8 file with a
+        // byte-order mark, which is invisible everywhere except in front of the atom count, where
+        // it turns a perfectly good file into "invalid XYZ atom count: 3".
+        let mut lines = text.strip_prefix('\u{feff}').unwrap_or(text).lines();
         let natoms_line = lines
             .next()
             .ok_or_else(|| Pm3Error::InvalidInput("empty XYZ".to_string()))?;
@@ -73,7 +99,16 @@ impl Molecule {
             Pm3Error::InvalidInput(format!("invalid XYZ atom count: {natoms_line}"))
         })?;
         let _comment = lines.next().unwrap_or_default();
-        let mut atoms = Vec::with_capacity(natoms);
+        // Reserve for what the file can actually hold, not for what its first line claims.
+        //
+        // The count is the first token of an untrusted file and it used to size the allocation
+        // directly, so a corrupted or hostile header ("99999999999") aborted the process on an
+        // allocation failure instead of returning `Pm3Error::Parse`. The loop below already
+        // refuses a file that ends early, so the honest bound is the number of lines left: it
+        // costs one pass over a string that has just been read, and it turns an abort into the
+        // error the caller is prepared for.
+        let remaining = text.lines().count().saturating_sub(2);
+        let mut atoms = Vec::with_capacity(natoms.min(remaining));
         for idx in 0..natoms {
             let line_no = idx + 3;
             let line = lines
@@ -99,6 +134,7 @@ impl Molecule {
             atoms,
             charge,
             multiplicity: 1,
+            cell: None,
         })
     }
 }
@@ -151,3 +187,32 @@ pub const ELEMENTS: [&str; 108] = [
     "Tl", "Pb", "Bi", "Po", "At", "Rn", "Fr", "Ra", "Ac", "Th", "Pa", "U", "Np", "Pu", "Am", "Cm",
     "Bk", "Mi", "XX", "+3", "-3", "Cb", "++", "+", "--", "-", "Tv",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WATER: &str = "3\nwater\nO 0.0 0.0 0.1173\nH 0.0 0.7572 -0.4692\nH 0.0 -0.7572 -0.4692\n";
+
+    /// Saving an XYZ file from Notepad, or from PowerShell's `Set-Content -Encoding utf8`, puts a
+    /// byte-order mark in front of the atom count. The file looks identical in every editor and
+    /// used to be rejected with a message naming a number that was plainly a number.
+    #[test]
+    fn a_byte_order_mark_does_not_make_a_file_unreadable() {
+        let plain = Molecule::from_xyz_str(WATER, 0.0).unwrap();
+        let marked = Molecule::from_xyz_str(&format!("\u{feff}{WATER}"), 0.0).unwrap();
+
+        assert_eq!(marked.atoms.len(), plain.atoms.len());
+        for (a, b) in marked.atoms.iter().zip(&plain.atoms) {
+            assert_eq!(a.z, b.z);
+            assert!((a.position - b.position).norm() < 1.0e-15);
+        }
+    }
+
+    /// One mark is stripped, not any number of them: a second is a genuinely malformed file and
+    /// should still say so rather than being silently tidied away.
+    #[test]
+    fn only_the_leading_mark_is_forgiven() {
+        assert!(Molecule::from_xyz_str(&format!("\u{feff}\u{feff}{WATER}"), 0.0).is_err());
+    }
+}

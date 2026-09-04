@@ -250,6 +250,20 @@ pub fn h4_energy(mol: &Molecule) -> f64 {
 
 /// H4 hydrogen-bond correction energy (eV), generic over the scalar.
 pub fn h4_energy_g<S: Scalar>(numbers: &[u8], pos: &[[S; 3]]) -> S {
+    h4_energy_cluster_g(numbers, pos, numbers.len())
+}
+
+/// H4 over an image-expanded cluster, generic over the scalar.
+///
+/// `n_cell` is how many leading entries belong to the reference cell. Each hydrogen-bond triple
+/// has exactly one hydrogen, so assigning the triple to the cell that hydrogen sits in counts
+/// every crystal-distinct triple exactly once — no fractional weights, and no ambiguity about
+/// which cell owns a bond that straddles a boundary. Donor and acceptor may be anywhere in the
+/// cluster, which is what lets hydrogen bonds cross the cell edge; in ice or a molecular crystal
+/// most of them do.
+///
+/// With `n_cell = numbers.len()` this is exactly the molecular sum.
+pub fn h4_energy_cluster_g<S: Scalar>(numbers: &[u8], pos: &[[S; 3]], n_cell: usize) -> S {
     let n = numbers.len();
     let is_don_acc = |z: u8| z == 7 || z == 8;
     let a = BOHR_TO_ANGSTROM;
@@ -266,7 +280,7 @@ pub fn h4_energy_g<S: Scalar>(numbers: &[u8], pos: &[[S; 3]]) -> S {
             if rda.val() >= CUTOFF_DA {
                 continue; // donor–acceptor beyond the correction's range
             }
-            for h in 0..n {
+            for h in 0..n_cell {
                 if numbers[h] != 1 {
                     continue;
                 }
@@ -347,22 +361,30 @@ pub fn hh_rep_energy(mol: &Molecule) -> f64 {
 
 /// Generic (over the scalar) H–H repulsion energy (eV).
 pub fn hh_rep_energy_g<S: Scalar>(numbers: &[u8], pos: &[[S; 3]]) -> S {
+    hh_rep_energy_cluster_g(numbers, pos, numbers.len())
+}
+
+/// H–H repulsion over an image-expanded cluster, generic over the scalar. See
+/// [`h4_energy_cluster_g`] for what `n_cell` means; here the tuple is a pair, so the sum runs
+/// over cell atoms against the whole cluster with weight ½.
+pub fn hh_rep_energy_cluster_g<S: Scalar>(numbers: &[u8], pos: &[[S; 3]], n_cell: usize) -> S {
     let n = numbers.len();
     let a = BOHR_TO_ANGSTROM;
     let mut sum_kcal = S::cst(0.0);
-    for i in 0..n {
+    for i in 0..n_cell {
         if numbers[i] != 1 {
             continue;
         }
-        for j in 0..i {
-            if numbers[j] != 1 {
+        for j in 0..n {
+            if j == i || numbers[j] != 1 {
                 continue;
             }
             let r = dist_g(&pos[i], &pos[j]) * a;
             sum_kcal = sum_kcal + poly_hh_g(r);
         }
     }
-    sum_kcal * KCAL_TO_EV
+    // The ½ pairs with the ordered loop: `½ Σ_i Σ_{j≠i} = Σ_{i<j}` for the molecular case.
+    sum_kcal * (0.5 * KCAL_TO_EV)
 }
 
 #[cfg(test)]

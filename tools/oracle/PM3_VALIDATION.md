@@ -6,9 +6,12 @@
 - method: `PM3 PRECISE AUX(PRECISION=9)`
 - harness: `tools/oracle/run_mopac.py`
 - frozen Rust comparisons: `tests/molecules.rs`
+- reproduction audit and known deviations: `tools/oracle/PM3_AUDIT.md`
 
-The MOPAC executable is not redistributed. Place it under the gitignored
-`tools/oracle/mopac/` directory or set `MOPAC_EXE` when importing the harness.
+The MOPAC executable is not redistributed. Run
+`python tools/oracle/fetch_mopac.py` to download the
+official portable archive into the gitignored `tools/oracle/mopac/` directory (its
+SHA-256 is pinned in the script), or set `MOPAC_EXE` when importing the harness.
 
 ## Single-point heats of formation
 
@@ -49,28 +52,42 @@ Sparkle carries +3 and each fluorine carries -1 to numerical precision.
 - MOPAC special atoms `Cb`, `+`, and `-`.
 
 For every case, the same input geometry is used by both programs and the audit
-compares the heat of formation, all `3N` Cartesian gradient components, and all
-`(3N)^2` Cartesian Hessian elements. The reference Hessian in
+compares the heat of formation, all `3N` Cartesian gradient components, all
+`(3N)^2` Cartesian Hessian elements, the Mulliken charges, the dipole vector,
+and every molecular-orbital energy. The reference Hessian in
 `ALL_ELEMENTS_RESULTS.json` is a central difference of MOPAC analytic gradients
 with a 0.001 Angstrom displacement and `NOREOR`.
 
-The 60/60 completed sweep has these maximum absolute differences:
+The 60/60 completed sweep has these maximum absolute differences, re-run at
+v0.2.1 and unchanged from v0.2.0 in every digit that matters:
 
 | Quantity | Maximum absolute difference |
 |---|---:|
-| Heat of formation | 0.0839253 kcal/mol |
-| Cartesian gradient | 1.60353e-4 eV/Bohr |
-| Cartesian Hessian | 2.23658e-2 eV/Bohr^2 |
+| Heat of formation | 0.0839224 kcal/mol |
+| Cartesian gradient | 1.60352e-4 eV/Bohr |
+| Cartesian Hessian | 2.23657e-2 eV/Bohr^2 |
+| Mulliken charge | 5.85332e-5 e |
+| Dipole component | 2.49155e-4 D |
+| MO energy | 1.53202e-4 eV |
 
 The energy maximum is the `Cb` fixture, whose heat of formation is about
 -1.171e8 kcal/mol because MOPAC deliberately uses a -9,999,999 eV resonance
 sentinel; its relative energy error is below 1e-9. The Hessian maximum comes
 from differentiating finite-precision MOPAC gradient output for heavy atoms.
 Using a 0.005 Angstrom difference for As/Br/I reduces their maximum to
-4.925e-3 eV/Bohr^2. Direct MOPAC FORCE comparisons are retained in
-`ALL_ELEMENTS_FORCE_RESULTS.json`; on non-stationary geometries they include
-MOPAC's rotational/translational treatment and are therefore not the primary
-Cartesian derivative oracle.
+4.925e-3 eV/Bohr^2. Every remaining outlier is an element with valence principal
+quantum number >= 4; that deviation is characterised and bounded in
+`tools/oracle/PM3_AUDIT.md`.
+
+`ALL_ELEMENTS_FORCE_RESULTS.json` repeats the sweep with MOPAC's analytic
+`FORCE` Hessian instead of the finite-difference reference. Its Hessian
+differences are larger because MOPAC's `FORCE` output on a non-stationary
+geometry carries MOPAC's rotational/translational projection, which the plain
+Cartesian second derivative does not; it is therefore not the primary derivative
+oracle. Its *energies* are the same quantity as the finite-difference sweep's and
+must agree with them — an earlier copy of the file disagreed by 48 kcal/mol on
+`SbH3` because it had been generated from a superseded planar fixture, which is
+recorded in `PM3_AUDIT.md`.
 
 ## PM3-D3 family
 
@@ -87,6 +104,30 @@ source verification and derivative consistency:
 - Unit tests cover the coefficient sets and energy signs; the analytic Hessian
   test covers D3 coordination-number coupling and H4/H-H terms.
 
+## External electric field
+
+MOPAC's `FIELD=(x,y,z)` keyword applies a uniform field in **volts per Ångström**
+with `E = E₀ + μ·F` — the plus sign following from MOPAC reporting the dipole in
+the chemistry convention, pointing from negative to positive. The unit and the
+sign were **measured, not assumed**: `tests/molecules.rs`
+(`an_external_field_matches_the_mopac_field_keyword`) freezes MOPAC's own heat of
+formation for water at `FIELD=0.001`, `0.002` and `0.004` and reproduces all
+eight digits MOPAC prints.
+
+`internal_consistency.py` adds the identity that needs no oracle:
+`μ = ∂E/∂F`, by central difference of the CLI's own energy against the dipole
+the CLI reports. Neutral systems only — `∂E/∂F` is about the field's origin, the
+coordinate origin, while the reported dipole is about the centre of mass, and
+for an ion those differ by `Q` times their separation.
+
+Over the 60-case sweep the worst disagreement is **4.0e-6 D** (`KH`), against
+dipoles of order 1–10 D. The single exception is the `Cb` capped-bond fixture at
+6.3e-2 D, which is the same sentinel artefact that gives it a gradient residual
+of 2.6e6 eV/Bohr: MOPAC assigns `Cb` a −9,999,999 eV resonance integral, so every
+finite difference of its energy is dominated by that number rather than by
+physics. It is characterised in `PM3_AUDIT.md`. Excluding it, the sweep's worst
+analytic-gradient-versus-finite-difference residual is 8.2e-5 eV/Bohr.
+
 ## Documented-API conformance
 
 Independently of the numerical oracle, every code block and stated guarantee in
@@ -102,13 +143,12 @@ Independently of the numerical oracle, every code block and stated guarantee in
 
 ## Reproduction
 
-```powershell
-$env:CARGO_BUILD_JOBS='1'
+```bash
 cargo test --all-targets --all-features
 python tools/oracle/run_mopac.py examples/water.xyz --method PM3
 ```
 
-```powershell
+```bash
 maturin develop --release --features python
-python -m pytest tests/test_python.py tests/test_python_api.py
+python -m pytest tests/
 ```

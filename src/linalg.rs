@@ -173,12 +173,7 @@ impl Matrix {
             self.data
                 .par_chunks(PAR_CHUNK)
                 .zip(other.data.par_chunks(PAR_CHUNK))
-                .map(|(a, b)| {
-                    a.iter()
-                        .zip(b)
-                        .map(|(x, y)| (x - y) * (x - y))
-                        .sum::<f64>()
-                })
+                .map(|(a, b)| a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f64>())
                 .sum::<f64>()
         };
         (sum / n as f64).sqrt()

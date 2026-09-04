@@ -215,6 +215,93 @@ fn mopac_point_charges_match_oracle() {
     assert!((minus_result.charges[3] + 1.0).abs() < 1e-12);
 }
 
+/// The dipole of a **charged** system depends on the origin, so the origin is part of the
+/// definition. MOPAC (`dipole.F90`) references it to the centre of mass, with its point atoms
+/// `+`/`-` carrying zero mass. pm3-rs referenced it to the coordinate origin instead, which made
+/// the reported dipole of every ion depend on where the molecule happened to sit: translating
+/// NH4+ by 5 Å moved its dipole from 0 to 24.02 D. Fixed in 0.2.0; these are the MOPAC v23.2.5
+/// values at the same geometries.
+#[test]
+fn charged_system_dipole_matches_mopac_and_is_translation_invariant() {
+    // NH4+ is tetrahedral, so its dipole is exactly zero wherever it sits.
+    const NH4_PLUS: &str = "5\nammonium\nN 0 0 0\nH 0.63 0.63 0.63\nH -0.63 -0.63 0.63\nH -0.63 0.63 -0.63\nH 0.63 -0.63 -0.63\n";
+    const NH4_PLUS_SHIFTED: &str = "5\nammonium shifted\nN 5 0 0\nH 5.63 0.63 0.63\nH 4.37 -0.63 0.63\nH 4.37 0.63 -0.63\nH 5.63 -0.63 -0.63\n";
+
+    let at_origin = hof(NH4_PLUS, 1.0, 1);
+    let shifted = hof(NH4_PLUS_SHIFTED, 1.0, 1);
+    // MOPAC reports 8.0e-11 D at both placements.
+    assert!(
+        at_origin.dipole_magnitude < 1.0e-8,
+        "NH4+ dipole at the origin should vanish, got {} D",
+        at_origin.dipole_magnitude
+    );
+    assert!(
+        shifted.dipole_magnitude < 1.0e-8,
+        "NH4+ dipole must not depend on where the ion sits, got {} D after a 5 Å shift",
+        shifted.dipole_magnitude
+    );
+    // Same heat of formation either way (a pure translation cannot change it).
+    assert!((at_origin.heat_of_formation_kcal - shifted.heat_of_formation_kcal).abs() < 1e-6);
+
+    // Water plus a MOPAC `+` point atom: a charged system with a genuinely non-zero dipole,
+    // and one whose zero-mass point atom must shift the charge distribution without moving
+    // the centre of mass. MOPAC v23.2.5: (0.92295852, 1.19207248, 14.38633218) D.
+    let plus = "4\nwater plus\nO 0 0 0\nH 0.9584 0 0\nH -0.24 0.9278 0\n+ 0 0 3\n";
+    let r = hof(plus, 1.0, 1);
+    let reference = [
+        0.922_958_525_869_74,
+        1.192_072_477_432_1,
+        14.386_332_179_826,
+    ];
+    let got = [r.dipole_debye.x, r.dipole_debye.y, r.dipole_debye.z];
+    for (axis, (value, expected)) in got.iter().zip(&reference).enumerate() {
+        assert!(
+            (value - expected).abs() < 1.0e-5,
+            "dipole component {axis}: pm3-rs {value} vs MOPAC {expected}"
+        );
+    }
+}
+
+/// Every element with valence principal quantum number ≥ 4 carries a small, systematic
+/// deviation from MOPAC — pm3-rs evaluates their diatomic overlap by converged quadrature
+/// while MOPAC's closed-form `diat`/`SS` uses series expansions that differ at the 1e-8
+/// level. The deviation is characterised in `tools/oracle/PM3_AUDIT.md`; it is bounded by
+/// 1.05e-3 kcal/mol, which is three orders of magnitude below chemical significance. This
+/// test pins that bound so it cannot silently grow, and would also catch a regression that
+/// accidentally made the heavy-element path much *worse*.
+#[test]
+fn heavy_element_deviation_from_mopac_stays_bounded() {
+    // MOPAC v23.2.5 heats of formation at these exact geometries (the fixtures
+    // `tools/oracle/all_element_validation.py` generates for Ge, Se and Bi).
+    const CASES: [(&str, f64); 3] = [
+        (
+            "5\nGeH4\nGe 0 0 0\nH 0.9153888518 0.9153888518 0.9153888518\nH -0.9153888518 -0.9153888518 0.9153888518\nH -0.9153888518 0.9153888518 -0.9153888518\nH 0.9153888518 -0.9153888518 -0.9153888518\n",
+            36.517_700_295_622_9,
+        ),
+        (
+            "3\nSeH2\nSe 0 0 0\nH 1.5855 0 0\nH -0.396375 1.5351537739 0\n",
+            27.719_425_002_056_6,
+        ),
+        (
+            "4\nBiH3\nBi 0 0 0\nH 1.7929287290 0 0.56385\nH -0.8964643645 1.5527218265 0.56385\nH -0.8964643645 -1.5527218265 0.56385\n",
+            45.042_139_218_554,
+        ),
+    ];
+    // The audit's measured bound, with a little headroom; tightening this is a real
+    // improvement, loosening it means the heavy-element path changed.
+    const BOUND_KCAL: f64 = 2.0e-3;
+    for (xyz, mopac) in CASES {
+        let r = hof(xyz, 0.0, 1);
+        assert!(r.converged);
+        let difference = (r.heat_of_formation_kcal - mopac).abs();
+        assert!(
+            difference < BOUND_KCAL,
+            "heavy-element deviation grew: pm3-rs {} vs MOPAC {mopac} ({difference:.3e} kcal/mol)",
+            r.heat_of_formation_kcal
+        );
+    }
+}
+
 #[test]
 fn mopac_special_atom_parameters_are_available() {
     use pm3_rs::{symbol_to_z, z_to_symbol};
@@ -247,4 +334,107 @@ fn methyl_radical_uhf_matches_mopac() {
         "methyl radical HoF {}",
         r.heat_of_formation_kcal
     );
+}
+
+/// The external electric field, against MOPAC's own `FIELD=` keyword.
+///
+/// MOPAC's units and sign are not documented in a way worth trusting, so they were **measured**:
+/// running water at `FIELD=(f,0,0)` and differencing the heat of formation gives
+/// `dE/df = +0.22451 eV` per unit, against a dipole of `0.22458 e.Angstrom`. So MOPAC's field is
+/// in **volts per Angstrom** and carries the sign convention `E = E0 + mu.F` -- the opposite of
+/// the physical one, in which a dipole aligned with the field is *stabilized*.
+///
+/// This crate uses the physical convention, `E = E0 - mu.f`, with `f` in eV per Bohr per
+/// elementary charge, so the two are related by
+///
+/// ```text
+/// f = -F * BOHR_TO_ANGSTROM
+/// ```
+///
+/// and the frozen numbers below are MOPAC's, to every digit it printed.
+#[test]
+fn an_external_field_matches_the_mopac_field_keyword() {
+    // MOPAC v23.2.5: `PM3 PRECISE AUX(PRECISION=9) 1SCF NOREOR FIELD=(f,0,0)`, minus the
+    // field-free heat of formation of the same geometry.
+    const MOPAC: [(f64, f64); 3] = [
+        (0.001, 0.005_178_44),
+        (0.002, 0.010_355_61),
+        (0.004, 0.020_706_08),
+    ];
+
+    let params = Pm3Parameters::standard().unwrap();
+    let molecule = Molecule::from_xyz_str(WATER, 0.0).unwrap();
+    let base = Pm3Options {
+        e_tol: 1.0e-12,
+        p_tol: 1.0e-11,
+        ..Pm3Options::default()
+    };
+    let zero = run_pm3(&molecule, &params, &base).unwrap();
+
+    for (mopac_field, expected) in MOPAC {
+        let field =
+            pm3_rs::math::Vec3::new(-mopac_field * pm3_rs::constants::BOHR_TO_ANGSTROM, 0.0, 0.0);
+        let options = Pm3Options {
+            field: Some(field),
+            ..base.clone()
+        };
+        let shifted = run_pm3(&molecule, &params, &options).unwrap();
+        let delta = shifted.heat_of_formation_kcal - zero.heat_of_formation_kcal;
+        assert!(
+            (delta - expected).abs() < 5.0e-8,
+            "FIELD=({mopac_field},0,0): got {delta:.8} kcal, MOPAC gives {expected:.8}"
+        );
+    }
+}
+
+/// Dipole derivatives against MOPAC, element by element.
+///
+/// MOPAC reports VIB._T_DIP for a FORCE run, but its normal-mode normalization is not documented
+/// well enough to compare an intensity against directly -- our |dmu/dQ| and its T_DIP agree only
+/// to a few percent, and the residual looks like a reduced-mass convention rather than an error.
+/// So the comparison is made one step earlier, where there is no convention at all: MOPAC's own
+/// dipole, central-differenced over each Cartesian coordinate.
+///
+/// That is dmu/dR exactly as we compute it analytically, and it agrees to every digit MOPAC's
+/// finite difference resolves. The frequencies at this geometry agree to 0.5 cm^-1
+/// (1742.11/3868.52/3988.94 against MOPAC's 1741.99/3867.75/3988.47), so the modes the tensor is
+/// projected onto are MOPAC's too.
+#[test]
+fn dipole_derivatives_match_mopac() {
+    // MOPAC v23.2.5, PM3 PRECISE AUX(PRECISION=9) 1SCF NOREOR, dipole central-differenced at
+    // +-0.005 Angstrom about the pm3-rs optimum below, converted from Debye to e.
+    const MOPAC: [[f64; 9]; 3] = [
+        [-0.64523, 0.0, 0.0, 0.32262, 0.0, 0.0, 0.32262, 0.0, 0.0],
+        [
+            0.0, -0.29722, 0.0, 0.0, 0.14861, 0.12714, 0.0, 0.14861, -0.12714,
+        ],
+        [
+            0.0, 0.0, -0.19191, 0.0, -0.00274, 0.09595, 0.0, 0.00274, 0.09595,
+        ],
+    ];
+    const OPTIMIZED: &str = "3\nwater\nO 0.0 0.0 0.10030517\nH 0.0 0.76783584 -0.46070259\nH 0.0 -0.76783584 -0.46070259\n";
+
+    let params = Pm3Parameters::standard().unwrap();
+    let molecule = Molecule::from_xyz_str(OPTIMIZED, 0.0).unwrap();
+    let options = Pm3Options {
+        e_tol: 1.0e-12,
+        p_tol: 1.0e-11,
+        max_scf: 500,
+        ..Pm3Options::default()
+    };
+    let analytic = pm3_rs::ir::dipole_derivatives(&molecule, &params, &options).unwrap();
+
+    let mut worst = 0.0_f64;
+    for (axis, row) in MOPAC.iter().enumerate() {
+        for (dof, expected) in row.iter().enumerate() {
+            worst = worst.max((analytic[(axis, dof)] - expected).abs());
+        }
+    }
+    // MOPAC's own central difference is only good to about this, which is what sets the bound.
+    assert!(
+        worst < 5.0e-5,
+        "the analytic dipole derivatives differ from MOPAC's by {worst:.3e} e"
+    );
+    // And the tensor is not trivially zero, so the agreement means something.
+    assert!(analytic[(0, 0)].abs() > 0.5);
 }

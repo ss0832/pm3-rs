@@ -14,6 +14,7 @@
 pub mod d3;
 pub mod h4;
 pub mod hx;
+pub mod periodic;
 
 use crate::dual::Scalar;
 use crate::system::Molecule;
@@ -43,21 +44,99 @@ pub(crate) fn dist_g<S: Scalar>(a: &[S; 3], b: &[S; 3]) -> S {
 
 /// Total correction energy (eV), **generic over the scalar** — the single source used for the
 /// energy (`f64`), gradient (`Dual`) and analytic Hessian (`Dual2`). `pos` is the Bohr geometry.
+///
+/// # Why there is no cutoff here, though the periodic path has one
+///
+/// Passing [`periodic::DEFAULT_D3_CUTOFF`] and [`periodic::DEFAULT_CN_CUTOFF`] here was tried and
+/// reverted, because it was measured to cost accuracy and buy nothing.
+///
+/// The cost, from `examples/correction_cutoff.rs` on blocks of water at liquid density: `1.4e-6`
+/// eV at 81 atoms, `2.8e-5` at 192, `2.5e-4` at 375. Extensive, since it is the dispersion of
+/// the pairs beyond the radius and a bigger system has more of them.
+///
+/// The gain was nil. `examples/correction_scaling.rs` puts the log-log slope at **1.959 with the
+/// cutoff applied** — still quadratic. Two reasons, and both have to be fixed before a radius is
+/// worth anything:
+///
+/// 1. The sums in [`d3`] and [`h4`] are `for i { for j { if r > cutoff { continue } } }`. That is
+///    an `O(N²)` traversal with a cheap body, not an `O(N)` one. Bounding the *range* does not
+///    bound the *work* until the inner loop comes from a neighbour list — `crate::neighbor` has
+///    the cell grid for it.
+/// 2. Even then, 30 Bohr at liquid water density encloses roughly 2000 atoms, so the D3 sphere is
+///    larger than every system in the measurement above. Below a couple of thousand atoms a D3
+///    cutoff excludes nothing and can only add error. The 15 Bohr coordination radius and H4's
+///    5.5 Å radius enclose far less and are where a grid would first pay.
+///
+/// So the order reduction for the correction Hessian — `O(N⁴)`, this crate's worst — is a real
+/// piece of work in the loop structure rather than a parameter, and it is **not done**. The two
+/// examples above are the measurements a future attempt should start from.
 pub fn correction_energy_g<S: Scalar>(numbers: &[u8], pos: &[[S; 3]], variant: Variant) -> S {
+    correction_energy_cluster_g(numbers, pos, numbers.len(), None, None, None, None, variant)
+}
+
+/// Total correction energy **per unit cell** (eV) over an image-expanded cluster.
+///
+/// The corrections are classical and finite-ranged, so the whole of periodicity for them is a
+/// question of counting: every distinct tuple in the crystal must contribute exactly once per
+/// cell. Each term uses the assignment that makes that automatic rather than a fractional
+/// weight, which is both cheaper and harder to get wrong:
+///
+/// | term | tuple | assigned to the cell containing |
+/// |---|---|---|
+/// | D3, H–H repulsion | pair | *(symmetric — summed cell × cluster with weight ½)* |
+/// | H4 | donor–hydrogen–acceptor | the **hydrogen**, of which every triple has exactly one |
+/// | X | halogen → acceptor | the **halogen**; the term is directed and its table asymmetric |
+///
+/// `n_cell` is how many leading entries of `numbers`/`pos` belong to the reference cell, and
+/// `parent` maps each image back to the cell atom it copies (used only by D3, whose coordination
+/// numbers would otherwise be truncated at the cluster boundary). Passing `n_cell =
+/// numbers.len()` and `parent = None` reproduces the molecular result exactly, which is what
+/// keeps the two paths from drifting apart.
+#[allow(clippy::too_many_arguments)] // parent and exact travel together and describe one cluster
+pub fn correction_energy_cluster_g<S: Scalar>(
+    numbers: &[u8],
+    pos: &[[S; 3]],
+    n_cell: usize,
+    parent: Option<&[usize]>,
+    // Per entry, whether the cluster is wide enough around it for its own coordination number to
+    // come out right. See [`d3::d3_energy_cluster_g`].
+    exact: Option<&[bool]>,
+    cutoff: Option<f64>,
+    cn_cutoff: Option<f64>,
+    variant: Variant,
+) -> S {
     let mut e = S::cst(0.0);
     match variant {
         Variant::Pm3 => {}
         Variant::Pm3D3 => {
-            e = e + d3::d3_energy_g(numbers, pos, &d3::D3Params::pm3_d3());
+            e = e + d3::d3_energy_cluster_g(
+                numbers,
+                pos,
+                n_cell,
+                parent,
+                exact,
+                cutoff,
+                cn_cutoff,
+                &d3::D3Params::pm3_d3(),
+            );
         }
         Variant::Pm3D3H4 | Variant::Pm3D3H4X => {
-            e = e + d3::d3_energy_g(numbers, pos, &d3::D3Params::pm3_d3h4());
-            e = e + h4::h4_energy_g(numbers, pos);
-            e = e + h4::hh_rep_energy_g(numbers, pos);
+            e = e + d3::d3_energy_cluster_g(
+                numbers,
+                pos,
+                n_cell,
+                parent,
+                exact,
+                cutoff,
+                cn_cutoff,
+                &d3::D3Params::pm3_d3h4(),
+            );
+            e = e + h4::h4_energy_cluster_g(numbers, pos, n_cell);
+            e = e + h4::hh_rep_energy_cluster_g(numbers, pos, n_cell);
         }
     }
     if variant.wants_x() {
-        e = e + hx::hx_energy_g(numbers, pos);
+        e = e + hx::hx_energy_cluster_g(numbers, pos, n_cell);
     }
     e
 }

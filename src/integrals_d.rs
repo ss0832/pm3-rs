@@ -50,18 +50,18 @@ pub fn pair_two_electron_spd_dual(
 }
 
 /// Angular momentum of each local orbital index (0-based 0..9).
-const LORB: [usize; 9] = [0, 1, 1, 1, 2, 2, 2, 2, 2];
+pub(crate) const LORB: [usize; 9] = [0, 1, 1, 1, 2, 2, 2, 2, 2];
 
 /// Standard packed pair index `indx(a,b) = a(a-1)/2 + b` (1-based, a≥b).
 #[inline]
-fn indx(a: usize, b: usize) -> usize {
+pub(crate) fn indx(a: usize, b: usize) -> usize {
     let (h, l) = if a >= b { (a, b) } else { (b, a) };
     h * (h - 1) / 2 + l
 }
 
 /// Column-major lower-triangle pair index `indexd(i,j)` (1-based, 9 rows).
 #[inline]
-fn indexd(i: usize, j: usize) -> usize {
+pub(crate) fn indexd(i: usize, j: usize) -> usize {
     let (hi, lo) = if i >= j { (i, j) } else { (j, i) };
     // -(lo*(lo-1))/2 + hi + 9*(lo-1)
     (hi + 9 * (lo - 1)) - (lo * (lo - 1)) / 2
@@ -69,7 +69,7 @@ fn indexd(i: usize, j: usize) -> usize {
 
 /// Multipole coefficient `ch(pair, l, m)` (MOPAC `fordd`, mndod.F90:3355).
 /// `pair` is the 1-based `indexd` value, `l ∈ {0,1,2}`, `m ∈ {-2..2}`.
-fn ch(pair: usize, l: usize, m: i32) -> f64 {
+pub(crate) fn ch(pair: usize, l: usize, m: i32) -> f64 {
     let s = |v: f64| v;
     let two_over_sqrt3 = 2.0 / 3.0_f64.sqrt(); // 1.15470054
     let one_over_sqrt3 = 1.0 / 3.0_f64.sqrt(); // 0.57735027

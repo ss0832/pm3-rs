@@ -145,6 +145,156 @@ println!("ΔHf = {} kcal/mol", res.scf.heat_of_formation_kcal);
 `OptOptions { max_iter, gtol /* eV/Bohr */, grad_step, history }`.
 `OptResult { molecule, scf, converged, iterations, trajectory }`.
 
+## Periodic boundary conditions
+
+A `Molecule` becomes periodic when it carries a `Cell`; the molecular entry
+points are unaffected and stay bit-identical when `cell` is `None`.
+
+```rust
+use pm3_rs::{Cell, Molecule};
+use pm3_rs::pbc::gamma::{run_gamma, PeriodicOptions};
+use pm3_rs::pbc::gradient::periodic_gradient;
+use pm3_rs::pbc::optimize::{relax, CellRelaxation, PeriodicOptOptions};
+
+let mut mol = Molecule::from_xyz_file("water.xyz", 0.0)?;
+mol.cell = Some(Cell::cubic(20.0)?);              // Bohr; periodic in x, y, z
+
+let scf = run_gamma(&mol, &params, &options, &PeriodicOptions::default())?;
+println!("{} eV per cell", scf.total_ev);
+
+let g = periodic_gradient(&mol, &params, &options, &PeriodicOptions::default())?;
+let stress = g.stress;                            // Option<Mat3>, eV/Bohr³
+
+let relaxed = relax(&mol, &params, &options, &PeriodicOptions::default(),
+                    &PeriodicOptOptions { cell: CellRelaxation::Variable,
+                                          ..PeriodicOptOptions::default() })?;
+```
+
+`Cell::new(a, b, c, [bool; 3])` builds 1D, 2D, and 3D cells; the non-periodic
+directions never enter the measure, the reciprocal basis, or the stress, so a
+slab's vacuum thickness cannot affect a result. `PeriodicResult` mirrors
+`Pm3Result` and adds `correction_ev`, `ewald_ev`, `spin_density`, and
+`gamma_margin`. `PeriodicGradient` carries `forces`, `gradient`, `virial`, and
+`stress`; the last two are `None` only for an isolated cell, which has no strain.
+A chain reports its axis, a slab its two in-plane components, and both put exact
+zeros in the non-periodic directions.
+
+**`gamma_margin` decides whether the result means anything.** It is the
+narrowest periodic width minus `PeriodicOptions::short_range_cutoff`, and it
+must be positive: one k-point substitutes `P(Γ)` for `P(0, T)` at every image,
+which is exact only when no image lies inside the exchange range. A cell one
+Bohr too narrow converges cleanly to an answer wrong by tens of eV. See
+[`pbc.md`](pbc.md) for the derivation, the measured numbers, and the treatment
+of charged cells, corrections, and reduced dimensionality.
+
+## Phonons at a wavevector
+
+`pbc::dfpt` gives the dynamical matrix and the phonon frequencies at any `q`
+from the primitive cell, without a supercell. Every item is re-exported at the
+crate root.
+
+```rust
+use pm3_rs::{dynamical_matrix, dynamical_matrix_on_mesh, phonon_frequencies,
+             rigid_ion_dynamical_matrix, KpointOptions};
+use pm3_rs::pbc::gamma::PeriodicOptions;
+
+let periodic = PeriodicOptions::default();
+let q = [0.25, 0.0, 0.0];                              // fractional
+
+let d = dynamical_matrix(&mol, &params, &options, &periodic, q)?;
+assert!(d.hermitian_defect < 1e-6);                    // reported, not assumed
+let freqs = phonon_frequencies(&mol, &params, &options, &periodic, q)?;  // cm⁻¹
+
+// The response over a mesh rather than Γ alone.
+let mesh = KpointOptions::mesh([4, 4, 4]);
+let dense = dynamical_matrix_on_mesh(&mol, &params, &options, &periodic, &mesh, q)?;
+
+// The fixed-density part by itself, for separating the rigid-ion and response halves.
+let rigid = rigid_ion_dynamical_matrix(&mol, &params, &options, &periodic, q)?;
+```
+
+Open and closed shell, plain PM3 and every corrected variant, any periodic
+dimensionality — a `q` component along a non-periodic axis is refused rather
+than summed. `DynamicalMatrix::hermitian_defect` is the largest departure from
+`D(q)† = D(q)` before the matrix is symmetrized; it is a property of the
+assembly, and reporting it is what makes a wrong one visible.
+
+## Response properties
+
+```rust
+use pm3_rs::{
+    born_charges, born_charge_sum_rule_residual, enforce_born_sum_rule,
+    polarizability, dielectric_tensor, static_dielectric_tensor,
+    add_non_analytic, non_analytic_term,
+    ForceConstants, q_path, berry_polarization,
+};
+
+let z = born_charges(&molecule, &params, &options, &periodic)?;
+let residual = born_charge_sum_rule_residual(&z);   // report, then decide
+
+let eps = dielectric_tensor(&molecule, &params, &options, &periodic)?.epsilon;
+let full = static_dielectric_tensor(&molecule, &params, &options, &periodic)?;
+// full.epsilon == full.electronic + full.ionic; full.skipped_modes says how
+// much of the ionic sum is missing, and three is the acoustic branch.
+
+let mut d = pm3_rs::dynamical_matrix(&molecule, &params, &options, &periodic, [0.0; 3])?;
+add_non_analytic(&mut d, &z, eps, [1.0, 0.0, 0.0], &molecule)?;   // LO-TO
+
+let fc = ForceConstants::from_supercell(&molecule, &params, &options, &periodic, [2, 2, 2])?;
+let bands = fc.band_structure(&q_path(&corners, 12))?;            // one Hessian
+```
+
+All Γ-point paths, and all of them only as good as the ground state under them:
+a `gamma_margin` at or below zero means one k-point cannot represent the cell,
+and the response inherits that silently.
+
+`berry_polarization` reaches `Z*` by a different formalism entirely and exists
+to check the above. Take differences through `BerryPolarization::difference` —
+polarization is defined modulo `e a/Ω`, and a plain subtraction is off by
+exactly one quantum whenever the two branches differ.
+
+```rust
+use pm3_rs::{run_finite_field, FiniteFieldOptions};
+
+let result = run_finite_field(
+    &molecule, &params, &options, &periodic,
+    [6, 1, 1],                      // the mesh; its division along a field
+    Vec3::new(1.0e-3, 0.0, 0.0),    // direction is that string's length
+    &FiniteFieldOptions::default(),
+)?;
+result.enthalpy_ev;   // E − Ω 𝓔·P, the quantity actually minimized
+result.resolved;      // which axes the mesh could see a phase along
+```
+
+A field **along** a periodic direction cannot be `−𝓔·r`: that is not
+lattice-periodic, and the ground state of `H − 𝓔·R` does not exist. This
+minimizes the Nunes–Gonze electric enthalpy instead. Restricted, gapped, 3D
+only, and there is **no force** — the nuclear derivative of the enthalpy is not
+implemented. A field orthogonal to every lattice vector needs none of this and
+stays on `Pm3Options::field`.
+
+## Dipole, infrared and Molden
+
+```rust
+use pm3_rs::{centre_of_mass, dipole_matrix, dipole_derivatives, ir_spectrum,
+             molden_string};
+
+let com = centre_of_mass(&mol, &params)?;
+let m = dipole_matrix(&mol, &params, &basis, com)?;     // [Matrix; 3], the operator
+let tensor = dipole_derivatives(&mol, &params, &options)?;   // 3 × 3N, in e
+let spectrum = ir_spectrum(&mol, &params, &options, 1e-3)?;  // cm⁻¹ and km/mol
+std::fs::write("water.molden", molden_string(&mol, &params, &scf)?)?;
+```
+
+`dipole_derivatives` costs **three** coupled-perturbed solves, not `3N`: the
+interchange theorem trades the nuclear perturbations for the field ones. The
+same operator backs the reported dipole and the external-field coupling, which
+is what makes `μ = −∂E/∂F` hold by construction rather than by coincidence.
+
+An external field is `Pm3Options::field`, in eV/Bohr with the sign that makes
+`E = E₀ + μ·F`, and reaches the energy, the analytic gradient and the analytic
+Hessian for both references. It is molecular only.
+
 ## Errors
 
 All fallible entry points return `pm3_rs::error::Result<T>` (alias for
@@ -162,7 +312,15 @@ pm3_rs_cli charges     water.xyz          # Mulliken charges + dipole
 pm3_rs_cli optimize    water.xyz          # writes water.pm3opt.xyz
 pm3_rs_cli hessian     water.xyz          # Cartesian Hessian
 pm3_rs_cli frequencies water.xyz --method pm3-d3h4
+pm3_rs_cli phonons     crystal.xyz --cell 10.0                  # Gamma point
+pm3_rs_cli phonons     crystal.xyz --cell 10.0 --q 0.25,0,0     # DFPT at a wavevector
+pm3_rs_cli phonons     crystal.xyz --cell 10.0 --q 0.25,0,0 --rigid-ion
 ```
+
+`--q` is in fractions of the reciprocal lattice vectors and needs a `--cell`;
+with `--kpts` the response is summed over that mesh, each point paired with
+`k + q`. `--rigid-ion` reports the fixed-density half of `D(q)` alone, which is
+what a supercell finite difference can be compared against directly.
 
 Flags: `--charge <q>`, `--multiplicity <m>`, `--method <pm3|pm3-d3|pm3-d3h4|pm3-d3h4x>`,
 `--no-diis`. Coordinates in the XYZ input/output are Ångström.

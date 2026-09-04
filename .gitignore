@@ -19,3 +19,29 @@ target
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# Provenance archive of the v0.1.2 source (kept on disk, not tracked)
+pm3-rs-*.zip
+
+
+# Local Python virtual environment for maturin develop / pytest
+.venv/
+
+
+# MOPAC oracle binaries (not redistributable; fetched by tools/oracle/fetch_mopac.py)
+tools/oracle/mopac/
+
+
+# Oracle scratch directory
+tools/oracle/_scratch/
+
+
+# Built wheels and source distributions
+dist/
+
+# Bytecode and the editable-install artifacts maturin drops next to the sources
+__pycache__/
+python/pm3_rs/_native.pyd
+python/pm3_rs/pm3_rs.pdb
+# Subagent worktrees, which are checkouts of this same repository.
+.claude/

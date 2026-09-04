@@ -55,9 +55,20 @@ pub fn hx_energy(mol: &Molecule) -> f64 {
 
 /// Halogen-bond correction energy (eV), generic over the scalar.
 pub fn hx_energy_g<S: Scalar>(numbers: &[u8], pos: &[[S; 3]]) -> S {
+    hx_energy_cluster_g(numbers, pos, numbers.len())
+}
+
+/// Halogen-bond correction over an image-expanded cluster, generic over the scalar.
+///
+/// `n_cell` is how many leading entries belong to the reference cell. The term is *directed* —
+/// halogen `i` donating to acceptor `j` is not the same as the reverse, and the parameter table
+/// `A_X`/`B_X` is asymmetric — so each ordered pair has exactly one halogen, and assigning the
+/// pair to the cell that halogen sits in counts every crystal-distinct pair once with no
+/// fractional weight. With `n_cell = numbers.len()` this is the molecular sum unchanged.
+pub fn hx_energy_cluster_g<S: Scalar>(numbers: &[u8], pos: &[[S; 3]], n_cell: usize) -> S {
     let n = numbers.len();
     let mut sum_kcal = S::cst(0.0);
-    for i in 0..n {
+    for i in 0..n_cell {
         for j in 0..n {
             if i == j {
                 continue;

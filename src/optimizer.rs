@@ -60,6 +60,18 @@ pub fn optimize(
     let ndof = 3 * nat;
     let mut mol = molecule.clone();
 
+    // A charged molecule in a uniform field has no minimum: the net force `−Q f` never vanishes,
+    // so the whole thing accelerates down the field forever and the optimizer runs to its
+    // iteration limit against a gradient that never falls. Warn rather than refuse — the run is
+    // legitimate if what is wanted is the trajectory rather than a stationary point.
+    if scf_options.field.is_some() && scf_options.charge != 0.0 {
+        eprintln!(
+            "warning: a net charge of {} in a uniform field feels a constant force, so this \
+             geometry has no minimum to find and the optimization will not converge",
+            scf_options.charge
+        );
+    }
+
     let mut x = flatten(&mol);
     let grad0 = closed_form_gradient(&mol, params, scf_options)?;
     let mut g = flatten_grad(&grad0.gradient);

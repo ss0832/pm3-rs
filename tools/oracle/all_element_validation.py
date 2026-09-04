@@ -253,6 +253,90 @@ def parse_hessian(text, ndof):
     return matrix
 
 
+def parse_charges_and_dipole(text):
+    """Mulliken charges (e) and the dipole vector (Debye) from `pm3_rs_cli charges`."""
+    charges = []
+    dipole = None
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) == 3 and fields[0].isdigit():
+            charges.append(float(fields[2]))
+        elif line.startswith("Dipole:"):
+            # "Dipole: x y z D; |mu| = m D"
+            head = line.split(";")[0].replace("Dipole:", "").replace("D", "").split()
+            dipole = [float(value) for value in head[:3]]
+    if not charges or dipole is None:
+        raise ValueError("pm3_rs_cli did not print charges and a dipole")
+    return charges, dipole
+
+
+def parse_mo_energies(text):
+    """Ascending molecular-orbital energies (eV) from `pm3_rs_cli energy`."""
+    match = re.search(r"^MO energies \(eV\):\s*\[(.*)\]\s*$", text, re.M)
+    if match is None:
+        raise ValueError("pm3_rs_cli did not print MO energies")
+    body = match.group(1).strip()
+    if not body:
+        return []
+    return [float(value) for value in body.split(",")]
+
+
+def max_abs_difference(left, right):
+    """Largest absolute elementwise difference of two flat sequences."""
+    return max(abs(a - b) for a, b in zip(left, right))
+
+
+# Orbital energies beyond this magnitude come from MOPAC's -9,999,999 eV capped-bond
+# resonance sentinel rather than from anything physical.
+SENTINEL_EV = 1.0e5
+
+# MOPAC writes a 1e-12 placeholder in place of each orbital it declines to report.
+MO_PADDING_EV = 1.0e-9
+
+
+def align_mo_window(rust_mo, mopac_mo, set_of_mos):
+    """Line up pm3-rs's MO list with the orbitals MOPAC actually reports.
+
+    Two MOPAC conventions get in the way of a naive elementwise comparison, and both
+    hide exactly the cases with the most unusual electronic structure:
+
+    * `EIGENVALUES` is not always the complete spectrum. `SET_OF_MOS` gives the
+      inclusive 1-based index range it covers, and for a Sparkle complex it starts
+      above 1 — so pm3-rs's list has to be sliced to the same window.
+    * For the capped bond `Cb`, MOPAC drops the two orbitals dominated by its
+      -9,999,999 eV resonance sentinel and pads the list with exact zeros, while
+      pm3-rs reports them at about +-2.8e6 eV. Comparing the padded entries against
+      real orbitals produces meaningless multi-eV "errors" that mask the fact that
+      the nine physical orbitals agree to 1e-8 eV.
+
+    Returns `(rust_window, mopac_window)`, both ascending and of equal length, or
+    `None` when the two lists cannot be aligned at all.
+    """
+    ordered = sorted(mopac_mo)
+    rust_physical = [value for value in rust_mo if abs(value) < SENTINEL_EV]
+    mopac_physical = [value for value in ordered if abs(value) < SENTINEL_EV]
+    if len(mopac_physical) > len(rust_physical):
+        # MOPAC pads the sentinel-dominated orbitals it dropped with a 1e-12
+        # placeholder, not an exact zero, so the padding is matched by magnitude.
+        trimmed = [value for value in mopac_physical if abs(value) > MO_PADDING_EV]
+        if len(trimmed) == len(rust_physical):
+            mopac_physical = trimmed
+    if len(rust_physical) == len(mopac_physical) and rust_physical:
+        return rust_physical, mopac_physical
+    if len(ordered) == len(rust_mo):
+        return rust_mo, ordered
+    if isinstance(set_of_mos, str):
+        fields = set_of_mos.split()
+        if len(fields) == 2:
+            try:
+                first, last = int(fields[0]), int(fields[1])
+            except ValueError:
+                return None
+            if 1 <= first <= last <= len(rust_mo) and last - first + 1 == len(ordered):
+                return rust_mo[first - 1 : last], ordered
+    return None
+
+
 def max_vector_difference(left, right):
     return max(abs(a - b) for row_a, row_b in zip(left, right) for a, b in zip(row_a, row_b))
 
@@ -292,7 +376,7 @@ def mopac_fd_hessian(xyz, case, step_angstrom):
     return matrix
 
 
-def validate_case(case, cli, directory, hessian_source, fd_step):
+def validate_case(case, cli, directory, hessian_source, fd_step, mopac_keywords=()):
     xyz = os.path.join(directory, case["name"] + ".xyz")
     write_xyz(xyz, case["atoms"], case["name"])
     mopac = run_mopac.run(
@@ -301,7 +385,7 @@ def validate_case(case, cli, directory, hessian_source, fd_step):
         charge=case["charge"],
         mult=case["multiplicity"],
         mode="force" if hessian_source == "force" else "gradient",
-        extra_keywords=("NOREOR",),
+        extra_keywords=("NOREOR",) + tuple(mopac_keywords),
     )
     if mopac["heat_of_formation_kcal"] is None:
         raise ValueError("MOPAC did not report a heat of formation")
@@ -317,6 +401,7 @@ def validate_case(case, cli, directory, hessian_source, fd_step):
     energy_text = run_cli(cli, "energy", xyz, case["charge"], case["multiplicity"])
     gradient_text = run_cli(cli, "gradient", xyz, case["charge"], case["multiplicity"])
     hessian_text = run_cli(cli, "hessian", xyz, case["charge"], case["multiplicity"])
+    charges_text = run_cli(cli, "charges", xyz, case["charge"], case["multiplicity"])
     natoms = len(case["atoms"])
     rust_gradient = parse_gradient(gradient_text, natoms)
     rust_hessian = parse_hessian(hessian_text, 3 * natoms)
@@ -329,6 +414,55 @@ def validate_case(case, cli, directory, hessian_source, fd_step):
         for atom in range(natoms)
     ]
 
+    # Density-derived comparisons. The energy expression is stationary in the
+    # density, so an error in a one-center term can cancel out of the energy and
+    # its derivatives while still leaving the density wrong; Mulliken charges,
+    # the dipole (which adds the s-p hybrid term) and the orbital eigenvalues
+    # probe the density and the Fock matrix directly.
+    rust_charges, rust_dipole = parse_charges_and_dipole(charges_text)
+    rust_mo = parse_mo_energies(energy_text)
+    charge_error = None
+    if mopac["charges"] is not None and len(mopac["charges"]) == len(rust_charges):
+        charge_error = max_abs_difference(rust_charges, mopac["charges"])
+    dipole_error = None
+    # MOPAC is not self-consistent about the dipole origin of a charged system: its
+    # 1SCF/GRADIENTS path reports the dipole about the centre of mass, its FORCE path
+    # about the coordinate origin. (HeH+ at the same geometry: 2.62260 D from 1SCF,
+    # 3.49218 D from FORCE — a difference of exactly 4.80320 D/(e*A) times the 0.18104 A
+    # centre-of-mass offset.) pm3-rs follows the documented centre-of-mass convention, so
+    # comparing against the FORCE path would compare two different definitions. The
+    # finite-difference sweep is the dipole oracle; the FORCE sweep records why it abstains.
+    dipole_origin_note = None
+    if hessian_source == "force" and abs(case["charge"]) > 0:
+        dipole_origin_note = "skipped: MOPAC FORCE reports a charged system's dipole about the coordinate origin, not the centre of mass"
+    elif mopac["dipole_debye"] is not None and len(mopac["dipole_debye"]) >= 3:
+        dipole_error = max_abs_difference(rust_dipole, mopac["dipole_debye"][:3])
+    mo_error = None
+    mo_relative_error = None
+    mo_error_finite = None
+    mopac_mo = mopac["eigenvalues_ev"]
+    if isinstance(mopac_mo, list) and rust_mo:
+        window = align_mo_window(rust_mo, mopac_mo, mopac.get("set_of_mos"))
+        if window is not None:
+            rust_window, mopac_window = window
+            mo_error = max_abs_difference(rust_window, mopac_window)
+            mo_relative_error = max(
+                abs(a - b) / max(abs(a), abs(b), 1.0)
+                for a, b in zip(rust_window, mopac_window)
+            )
+            # MOPAC's capped bond `Cb` carries a -9,999,999 eV resonance sentinel,
+            # which puts one orbital eight orders of magnitude above the rest. Its
+            # absolute difference is meaningless as a model-agreement measure (the
+            # relative one is ~1e-9), so the physically comparable orbitals are also
+            # reported on their own.
+            finite = [
+                (a, b)
+                for a, b in zip(rust_window, mopac_window)
+                if abs(a) < SENTINEL_EV and abs(b) < SENTINEL_EV
+            ]
+            if finite:
+                mo_error_finite = max(abs(a - b) for a, b in finite)
+
     result = {key: value for key, value in case.items() if key != "atoms"}
     result.update(
         {
@@ -340,8 +474,20 @@ def validate_case(case, cli, directory, hessian_source, fd_step):
             "hessian_max_abs_error_ev_per_bohr2": max_vector_difference(
                 rust_hessian, mopac_hessian
             ),
+            "charge_max_abs_error_e": charge_error,
+            "dipole_max_abs_error_debye": dipole_error,
+            "dipole_origin_note": dipole_origin_note,
+            "mo_energy_max_abs_error_ev": mo_error,
+            "mo_energy_max_abs_error_ev_finite": mo_error_finite,
+            "mo_energy_max_rel_error": mo_relative_error,
+            "energy_rel_error": (
+                abs(parse_heat(energy_text) - mopac["heat_of_formation_kcal"])
+                / max(abs(mopac["heat_of_formation_kcal"]), 1.0)
+            ),
+            "n_mo_compared": len(mopac["eigenvalues_ev"]) if mo_error is not None else 0,
             "mopac_hessian_source": hessian_source,
             "mopac_fd_step_angstrom": fd_step if hessian_source == "fd" else None,
+            "mopac_extra_keywords": list(mopac_keywords),
         }
     )
     return result
@@ -355,6 +501,17 @@ def main():
     parser.add_argument("--atom-code", type=int, action="append", default=[])
     parser.add_argument("--hessian-source", choices=("fd", "force"), default="fd")
     parser.add_argument("--fd-step", type=float, default=1.0e-3)
+    parser.add_argument(
+        "--mopac-keyword",
+        action="append",
+        default=[],
+        metavar="KEYWORD",
+        help=(
+            "extra MOPAC keyword (repeatable). Use CAMP to run MOPAC's Camp-King "
+            "converger, which is needed wherever MOPAC's default SCF path lands in a "
+            "higher fixed point than the one pm3-rs converges to."
+        ),
+    )
     args = parser.parse_args()
     cli = find_cli(args.cli)
     cases = build_cases()
@@ -368,13 +525,24 @@ def main():
     with tempfile.TemporaryDirectory(prefix="pm3rs_all_elements_") as directory:
         for index, case in enumerate(cases, 1):
             try:
-                result = validate_case(case, cli, directory, args.hessian_source, args.fd_step)
+                result = validate_case(
+                    case,
+                    cli,
+                    directory,
+                    args.hessian_source,
+                    args.fd_step,
+                    args.mopac_keyword,
+                )
                 result["status"] = "ok"
+                optional = lambda value, fmt: format(value, fmt) if value is not None else "n/a"
                 print(
                     f"[{index:02d}/{len(cases):02d}] {case['name']:<22s} "
                     f"dE={result['energy_abs_error_kcal']:.3e} kcal/mol "
                     f"dG={result['gradient_max_abs_error_ev_per_bohr']:.3e} eV/Bohr "
-                    f"dH={result['hessian_max_abs_error_ev_per_bohr2']:.3e} eV/Bohr^2"
+                    f"dH={result['hessian_max_abs_error_ev_per_bohr2']:.3e} eV/Bohr^2 "
+                    f"dq={optional(result['charge_max_abs_error_e'], '.3e')} e "
+                    f"dmu={optional(result['dipole_max_abs_error_debye'], '.3e')} D "
+                    f"dEmo={optional(result['mo_energy_max_abs_error_ev'], '.3e')} eV"
                 )
             except Exception as error:  # keep the exhaustive audit running
                 result = {key: value for key, value in case.items() if key != "atoms"}
@@ -399,6 +567,52 @@ def main():
         "max_hessian_abs_error_ev_per_bohr2": max(
             (result["hessian_max_abs_error_ev_per_bohr2"] for result in successful), default=None
         ),
+        "max_charge_abs_error_e": max(
+            (
+                result["charge_max_abs_error_e"]
+                for result in successful
+                if result.get("charge_max_abs_error_e") is not None
+            ),
+            default=None,
+        ),
+        "max_dipole_abs_error_debye": max(
+            (
+                result["dipole_max_abs_error_debye"]
+                for result in successful
+                if result.get("dipole_max_abs_error_debye") is not None
+            ),
+            default=None,
+        ),
+        "max_mo_energy_abs_error_ev": max(
+            (
+                result["mo_energy_max_abs_error_ev"]
+                for result in successful
+                if result.get("mo_energy_max_abs_error_ev") is not None
+            ),
+            default=None,
+        ),
+        # Same maximum with MOPAC's -9,999,999 eV capped-bond sentinel orbitals removed:
+        # this is the number that actually measures model agreement.
+        "max_mo_energy_abs_error_ev_finite": max(
+            (
+                result["mo_energy_max_abs_error_ev_finite"]
+                for result in successful
+                if result.get("mo_energy_max_abs_error_ev_finite") is not None
+            ),
+            default=None,
+        ),
+        "max_energy_rel_error": max(
+            (
+                result["energy_rel_error"]
+                for result in successful
+                if result.get("energy_rel_error") is not None
+            ),
+            default=None,
+        ),
+        "mo_comparison_count": sum(
+            1 for result in successful if result.get("mo_energy_max_abs_error_ev") is not None
+        ),
+        "mopac_extra_keywords": list(args.mopac_keyword),
     }
     payload = {"summary": summary, "results": results}
     with open(args.output, "w", encoding="utf-8") as handle:

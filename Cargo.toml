@@ -1,10 +1,10 @@
 [package]
 name = "pm3-rs"
-version = "0.1.2"
+version = "0.2.3"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["ss0832"]
-description = "Rust-native PM3 semiempirical NDDO method with MOPAC special atoms and lanthanide sparkles: heats of formation, analytic gradients and Hessians, D3/H4/X corrections, optimization, Rust, Python and ASE APIs."
+description = "Rust-native PM3 semiempirical NDDO method for molecules and periodic systems (1D/2D/3D, Gamma-point and k-point): heats of formation, analytic gradients, stress, Hessians and DFPT phonons, divide-and-conquer linear scaling, D3/H4/X corrections, MOPAC special atoms and lanthanide sparkles, Rust, Python and ASE APIs."
 autobins = false
 
 [lib]
@@ -21,6 +21,17 @@ path = "src/bin/pm3_rs.rs"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+
+# Development test loop. Fat LTO with one codegen unit costs ~8 minutes to link the
+# release test binaries, which is far too slow to iterate against; this profile keeps
+# `opt-level = 3` (the numerical kernels are unusable unoptimized) but drops LTO, so a
+# full `cargo test --profile quick` rebuilds in well under a minute. Release remains the
+# profile every result and timing is finally validated on.
+[profile.quick]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug-assertions = true
 
 [dependencies]
 faer = { version = "0.24", default-features = false, features = ["std", "linalg", "rayon"] }

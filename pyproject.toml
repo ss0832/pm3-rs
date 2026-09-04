@@ -4,13 +4,60 @@ build-backend = "maturin"
 
 [project]
 name = "pm3-rs-python"
-version = "0.1.2"
-description = "PM3 semiempirical method (pm3-rs) with a Python-native API and an ASE calculator, including PM3-D3/D3H4/D3H4X corrections"
+version = "0.2.3"
+description = "PM3 semiempirical method with periodic boundary conditions, divide-and-conquer, a Python-native API and an ASE calculator"
 readme = "README.md"
-license = { text = "GPL-3.0-or-later" }
 requires-python = ">=3.9"
 authors = [{ name = "ss0832" }]
 dependencies = ["numpy>=1.21"]
+
+# PEP 639: an SPDX expression plus the files it refers to, rather than the
+# deprecated `license = { text = ... }` table.
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+
+keywords = [
+    "chemistry",
+    "computational-chemistry",
+    "quantum-chemistry",
+    "semiempirical",
+    "pm3",
+    "nddo",
+    "mopac",
+    "ase",
+    "periodic-boundary-conditions",
+    "dft",
+]
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Operating System :: OS Independent",
+    "Typing :: Typed",
+]
+
+[project.scripts]
+# The same command the standalone Rust executable provides: `python/pm3_rs/cli.py` hands
+# `sys.argv` to the compiled implementation rather than reimplementing it, so `pip install`
+# and `cargo install` put the identical interface on the path.
+pm3-rs = "pm3_rs.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/ss0832/pm3-rs"
+Repository = "https://github.com/ss0832/pm3-rs"
+Documentation = "https://github.com/ss0832/pm3-rs/tree/main/docs"
+Changelog = "https://github.com/ss0832/pm3-rs/blob/main/CHANGELOG.md"
+Issues = "https://github.com/ss0832/pm3-rs/issues"
 
 [project.optional-dependencies]
 ase = ["ase>=3.22"]
@@ -19,3 +66,26 @@ ase = ["ase>=3.22"]
 features = ["python"]
 python-source = "python"
 module-name = "pm3_rs._native"
+# The parameter tables are `include_str!`-ed into the binary at compile time, so
+# they do not need to ship in the wheel 窶・but they do need to be in the sdist, or
+# a source build has nothing to compile against.
+include = [
+    { path = "src/data/*.csv", format = "sdist" },
+    { path = "docs/*.md", format = "sdist" },
+    { path = "tests/*.py", format = "sdist" },
+]
+exclude = [
+    "tools/**",
+    # Delivery archives of this very source tree. Harmless in a working copy,
+    # absurd inside the source distribution they are made from.
+    "*.zip",
+    "examples/**",
+    ".venv/**",
+    "target/**",
+    # Bytecode compiled for whichever interpreter happened to build the wheel.
+    # An abi3 wheel is installed under many versions, so shipping one version's
+    # .pyc is bloat at best and stale at worst.
+    "python/**/__pycache__/**",
+    "python/**/*.pyc",
+    "python/**/*.pdb",
+]

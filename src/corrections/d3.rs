@@ -153,11 +153,34 @@ use super::{dist2_g, dist_g};
 
 /// Coordination numbers (DFTD3 `ncoord`, k1 = 16), generic over the scalar so the analytic
 /// Hessian differentiates through the CN coupling. `pos` is the Bohr geometry.
-fn coordination_numbers_g<S: Scalar>(numbers: &[u8], pos: &[[S; 3]], d: &D3Data) -> Vec<S> {
+/// D3 coordination numbers, generic over the scalar.
+///
+/// `cutoff` bounds the pair sum. It is not an optimization: the counting function
+/// `1/(1 + exp(-K1(rco/r - 1)))` does **not** decay to zero with distance — it saturates at
+/// `1/(1 + e^16) ≈ 1.1e-7` — so over a large image cluster it accumulates a spurious
+/// contribution proportional to the number of atoms included. Truncating at a fixed physical
+/// radius makes the result depend on the structure rather than on how the cluster was built,
+/// which is what lets a unit cell and a supercell of it agree.
+fn coordination_numbers_g<S: Scalar>(
+    numbers: &[u8],
+    pos: &[[S; 3]],
+    d: &D3Data,
+    cutoff: Option<f64>,
+    n_cell: usize,
+    exact: Option<&[bool]>,
+) -> Vec<S> {
     const K1: f64 = 16.0;
     let n = numbers.len();
     let mut cn = vec![S::cst(0.0); n];
+    // The reference cell's own coordination numbers, plus those images the cluster is wide enough
+    // around to get right. Every other image takes its parent's, by translational symmetry, and
+    // the caller fills those in. Without the restriction this loop would be `O(cluster²)`, and
+    // the exact set is deliberately the smallest one that is honest rather than the whole
+    // cluster: it reaches only `cutoff − cn_cutoff` out from the cell.
     for i in 0..n {
+        if i >= n_cell && !exact.is_some_and(|flags| flags[i]) {
+            continue;
+        }
         let zi = numbers[i] as usize;
         if zi == 0 || zi > d.max_elem {
             continue;
@@ -171,6 +194,9 @@ fn coordination_numbers_g<S: Scalar>(numbers: &[u8], pos: &[[S; 3]], d: &D3Data)
                 continue;
             }
             let r = dist_g(&pos[j], &pos[i]);
+            if cutoff.is_some_and(|limit| r.val() > limit) {
+                continue;
+            }
             let rco = d.rcov[zi] + d.rcov[zj];
             // 1 / (1 + exp(-K1·(rco/r − 1)))
             cn[i] = cn[i] + (((r.recip() * rco - 1.0) * -K1).exp() + 1.0).recip();
@@ -347,22 +373,71 @@ pub fn d3_energy(mol: &Molecule, p: &D3Params) -> f64 {
 /// with [`crate::dual2::Dual2`] gives the exact second derivatives (the CN coupling included,
 /// since the coordination numbers are computed in the same generic arithmetic).
 pub fn d3_energy_g<S: Scalar>(numbers: &[u8], pos: &[[S; 3]], p: &D3Params) -> S {
+    d3_energy_cluster_g(numbers, pos, numbers.len(), None, None, None, None, p)
+}
+
+/// D3 dispersion over an image-expanded cluster, generic over the scalar.
+///
+/// `n_cell` is how many leading entries belong to the reference cell; the rest are periodic
+/// images. The pair sum runs over `i` in the cell against every `j` in the cluster with weight
+/// ½, which counts each interaction between two cell atoms once and each cell–image interaction
+/// half — exactly the per-cell energy. With `n_cell = numbers.len()` and no `parent` map this is
+/// identical to the molecular sum, since `½ Σ_i Σ_{j≠i} = Σ_{i<j}`.
+///
+/// `parent` maps each image back to the reference-cell atom it copies. Coordination numbers are
+/// computed on the cluster, where they are correct for the cell's own atoms but truncated for
+/// images near the cluster boundary; copying each image's coordination number from its parent
+/// restores it exactly, by translational symmetry. Skipping that step would let the boundary
+/// leak into `C6`, which the energy is quite sensitive to.
+///
+/// `exact` says, per entry, whether the cluster is wide enough around it for its own coordination
+/// number to come out right — see [`crate::corrections::periodic::Cluster::coordination_is_exact`].
+/// Where it is, the honest number is kept and the copy is skipped. **This matters only away from
+/// `q = 0`**, and it matters there a great deal: with every copy displaced alike the parent's
+/// coordination response *is* the image's, so the copy is exact and no test at `Γ` can see it
+/// being wrong. Under a phased displacement the copy hands the image the reference cell's
+/// response instead of its own.
+#[allow(clippy::too_many_arguments)] // parent and exact travel together and describe one cluster
+pub fn d3_energy_cluster_g<S: Scalar>(
+    numbers: &[u8],
+    pos: &[[S; 3]],
+    n_cell: usize,
+    parent: Option<&[usize]>,
+    exact: Option<&[bool]>,
+    cutoff: Option<f64>,
+    cn_cutoff: Option<f64>,
+    p: &D3Params,
+) -> S {
     let d = data();
-    let cn = coordination_numbers_g(numbers, pos, d);
+    let mut cn = coordination_numbers_g(numbers, pos, d, cn_cutoff, n_cell, exact);
+    if let Some(parent) = parent {
+        for index in n_cell..numbers.len() {
+            if exact.is_some_and(|flags| flags[index]) {
+                continue;
+            }
+            cn[index] = cn[parent[index]];
+        }
+    }
     let n = numbers.len();
     let mut e6 = S::cst(0.0);
     let mut e8 = S::cst(0.0);
-    for i in 0..n.saturating_sub(1) {
+    for i in 0..n_cell {
         let zi = numbers[i];
         if zi == 0 || zi as usize > d.max_elem {
             continue;
         }
-        for j in i + 1..n {
+        for j in 0..n {
+            if j == i {
+                continue;
+            }
             let zj = numbers[j];
             if zj == 0 || zj as usize > d.max_elem {
                 continue;
             }
             let r = dist_g(&pos[j], &pos[i]);
+            if cutoff.is_some_and(|limit| r.val() > limit) {
+                continue;
+            }
             let r2 = r * r;
             let r6 = r2 * r2 * r2;
             let r8 = r6 * r2;
@@ -376,8 +451,8 @@ pub fn d3_energy_g<S: Scalar>(numbers: &[u8], pos: &[[S; 3]], p: &D3Params) -> S
             e8 = e8 + c8 * damp8 / r8;
         }
     }
-    // Dispersion is attractive; energy in Hartree → eV.
-    -(e6 * p.s6 + e8 * p.s8) * HARTREE_TO_EV
+    // Dispersion is attractive; energy in Hartree -> eV. The ½ pairs with the ordered loop above.
+    -(e6 * p.s6 + e8 * p.s8) * (0.5 * HARTREE_TO_EV)
 }
 
 #[cfg(test)]
@@ -441,7 +516,7 @@ mod tests {
         )
         .unwrap();
         let (numbers, pos) = super::super::geometry_f64(&mol);
-        let cn = coordination_numbers_g::<f64>(&numbers, &pos, d);
+        let cn = coordination_numbers_g::<f64>(&numbers, &pos, d, None, numbers.len(), None);
         assert!((cn[0] - 2.0).abs() < 0.1, "O coordination number {}", cn[0]);
         assert!((cn[1] - 1.0).abs() < 0.1, "H coordination number {}", cn[1]);
         assert!(

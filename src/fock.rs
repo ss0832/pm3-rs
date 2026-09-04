@@ -50,6 +50,38 @@ impl SlotLayout {
     }
 }
 
+/// How the two-electron kernels read a density.
+///
+/// A dense `Matrix` and a divide-and-conquer sparse one are both densities and differ only in
+/// what they hold: outside its pattern the sparse one *is* zero, so a view that returns zero
+/// there is exact rather than approximate. Reading through this is what lets the same kernel
+/// serve the molecular SCF and the partitioned one without either knowing about the other.
+pub(crate) trait DensityView {
+    /// `P_{munu}`. A sparse view returns a structural zero outside its pattern, which for a
+    /// divide-and-conquer density is the value and not an approximation of it.
+    fn at(&self, mu: usize, nu: usize) -> f64;
+}
+
+impl DensityView for Matrix {
+    #[inline]
+    fn at(&self, mu: usize, nu: usize) -> f64 {
+        self[(mu, nu)]
+    }
+}
+
+/// A [`crate::dc::pattern::SparseMatrix`] with the pattern that gives it meaning.
+pub(crate) struct PatternedDensity<'a> {
+    pub pattern: &'a crate::dc::pattern::DensityPattern,
+    pub values: &'a crate::dc::pattern::SparseMatrix,
+}
+
+impl DensityView for PatternedDensity<'_> {
+    #[inline]
+    fn at(&self, mu: usize, nu: usize) -> f64 {
+        self.values.get(self.pattern, mu, nu)
+    }
+}
+
 /// Pack atom `a`'s density block into the `(μν)` multipole vector the two-center
 /// Coulomb kernel contracts against: off-diagonal orbital pairs are counted
 /// twice, since `P` is symmetric and `(μν|λσ) = (νμ|λσ)`.
@@ -58,11 +90,11 @@ impl SlotLayout {
 /// loop into two packed mat-vecs of `p_a · p_b` (256 → 100 multiply-adds for an
 /// sp/sp pair), with identical arithmetic.
 #[inline]
-fn packed_density(p: &Matrix, off: usize, n: usize, out: &mut [f64]) {
+fn packed_density<D: DensityView + ?Sized>(p: &D, off: usize, n: usize, out: &mut [f64]) {
     for mu in 0..n {
-        out[pack(mu, mu)] = p[(off + mu, off + mu)];
+        out[pack(mu, mu)] = p.at(off + mu, off + mu);
         for nu in 0..mu {
-            out[pack(mu, nu)] = 2.0 * p[(off + mu, off + nu)];
+            out[pack(mu, nu)] = 2.0 * p.at(off + mu, off + nu);
         }
     }
 }
@@ -71,13 +103,13 @@ fn packed_density(p: &Matrix, off: usize, n: usize, out: &mut [f64]) {
 /// `exchange_scale` is 1 for a spin Fock (`K` from the same-spin density) and
 /// ½ for the RHF response operator.
 #[allow(clippy::too_many_arguments)] // per-pair kernel: buffers, densities, weights
-fn pair_contribution(
+fn pair_contribution<D: DensityView + ?Sized>(
     slot: &mut [f64],
     layout: SlotLayout,
     pair: &PairIntegral,
     basis: &Basis,
-    p_coulomb: &Matrix,
-    p_exchange: &Matrix,
+    p_coulomb: &D,
+    p_exchange: &D,
     exchange_scale: f64,
     sw: f64,
 ) {
@@ -118,7 +150,7 @@ fn pair_contribution(
             for la in 0..nb {
                 let mut acc = 0.0;
                 for si in 0..nb {
-                    acc += p_exchange[(oa + nu, ob + si)] * row[pack(la, si)];
+                    acc += p_exchange.at(oa + nu, ob + si) * row[pack(la, si)];
                 }
                 k_ab[mu * layout.n_max + la] -= scale * acc;
             }
@@ -306,6 +338,109 @@ pub fn build_fock_spin(
 /// applies every pair at full weight → bit-identical to `build_fock(∂P) − H_core`.
 /// The one-center (intra-atomic) block is always exact and full (it is O(N), not
 /// the bottleneck).
+/// [`build_fock_spin`] onto a sparsity pattern, for divide-and-conquer.
+///
+/// The same arithmetic with a different destination. The partitioned solve reads the Fock matrix
+/// only where some subsystem holds both orbitals — that is what a subsystem gather *is* — so
+/// every other entry was computed, stored in an `nao × nao` array, and never looked at. At 960
+/// atoms that array is 128 MB and the part of it that gets read is a couple of megabytes.
+///
+/// The density is read the same way and for the same reason: outside the pattern a
+/// divide-and-conquer density is not small but structurally zero, so a sparse view returning
+/// zero there is the value rather than an approximation of it. See the note on
+/// [`crate::dc::pattern`].
+///
+/// The off-diagonal block is added twice rather than mirrored. The dense scatter writes
+/// `f[(b, a)] = f[(a, b)] + k`, reading one entry to set the other; that is an addition in
+/// disguise, because everything written before it — the core, the one-centre blocks, the
+/// earlier pairs — is symmetric, so the two entries are equal when it runs. Adding to both is
+/// the same number without the read, which on a sparse matrix costs a second search.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_fock_spin_sparse(
+    molecule: &Molecule,
+    basis: &Basis,
+    params: &Pm3Parameters,
+    core: &CoreHamiltonian,
+    h_core: &crate::dc::pattern::SparseMatrix,
+    pattern: &crate::dc::pattern::DensityPattern,
+    p_tot: &crate::dc::pattern::SparseMatrix,
+    p_spin: &crate::dc::pattern::SparseMatrix,
+    out: &mut crate::dc::pattern::SparseMatrix,
+) -> Result<()> {
+    out.values_mut().copy_from_slice(h_core.values());
+
+    for (ia, atom) in molecule.atoms.iter().enumerate() {
+        let elem = params.element(atom.z)?;
+        let off = basis.atom_offset[ia];
+        let n = basis.atom_norb[ia];
+        let (gss, gsp, gpp, gp2, hsp) = (elem.g_ss, elem.g_sp, elem.g_pp, elem.g_p2, elem.h_sp);
+        let oc = |a: usize, b: usize, c: usize, d: usize| -> f64 {
+            if let Some(spd) = &elem.onecenter {
+                spd.get(a, b, c, d)
+            } else {
+                oc_two_electron(a, b, c, d, gss, gsp, gpp, gp2, hsp)
+            }
+        };
+        for mu in 0..n {
+            for nu in 0..n {
+                let mut acc = 0.0;
+                for la in 0..n {
+                    for si in 0..n {
+                        acc += p_tot.get(pattern, off + la, off + si) * oc(mu, nu, la, si);
+                        acc -= p_spin.get(pattern, off + la, off + si) * oc(mu, la, nu, si);
+                    }
+                }
+                out.add(pattern, off + mu, off + nu, acc);
+            }
+        }
+    }
+
+    let coulomb = PatternedDensity {
+        pattern,
+        values: p_tot,
+    };
+    let exchange = PatternedDensity {
+        pattern,
+        values: p_spin,
+    };
+    let layout = SlotLayout::for_basis(basis);
+    let mut scratch = vec![0.0f64; PAIR_BATCH.min(core.pairs.len().max(1)) * layout.stride];
+    for batch in core.pairs.chunks(PAIR_BATCH) {
+        let used = &mut scratch[..batch.len() * layout.stride];
+        used.par_chunks_mut(layout.stride)
+            .zip(batch.par_iter())
+            .for_each(|(slot, pair)| {
+                pair_contribution(slot, layout, pair, basis, &coulomb, &exchange, 1.0, 1.0);
+            });
+        for (pair, slot) in batch.iter().zip(used.chunks(layout.stride)) {
+            let te = &pair.te;
+            let (oa, ob) = (basis.atom_offset[pair.a], basis.atom_offset[pair.b]);
+            let (na, nb) = (te.norb_i, te.norb_j);
+            let j_a = &slot[..layout.p_max];
+            let j_b = &slot[layout.p_max..2 * layout.p_max];
+            let k_ab = &slot[2 * layout.p_max..2 * layout.p_max + layout.n_max * layout.n_max];
+            for mu in 0..na {
+                for nu in 0..na {
+                    out.add(pattern, oa + mu, oa + nu, j_a[pack(mu, nu)]);
+                }
+            }
+            for la in 0..nb {
+                for si in 0..nb {
+                    out.add(pattern, ob + la, ob + si, j_b[pack(la, si)]);
+                }
+            }
+            for mu in 0..na {
+                for la in 0..nb {
+                    let value = k_ab[mu * layout.n_max + la];
+                    out.add(pattern, oa + mu, ob + la, value);
+                    out.add(pattern, ob + la, oa + mu, value);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn response_fock_rhf(
     molecule: &Molecule,
     basis: &Basis,
@@ -470,7 +605,8 @@ mod tests {
     /// actually allocated, or the guard is meaningless.
     #[test]
     fn pair_cache_estimate_matches_allocation() {
-        let xyz = "5\nmix\nS 0.0 0.0 0.0\nH 1.3 0.0 0.0\nH -0.3 1.3 0.0\nBr 2.9 0.4 0.5\nH 3.5 1.6 0.9\n";
+        let xyz =
+            "5\nmix\nS 0.0 0.0 0.0\nH 1.3 0.0 0.0\nH -0.3 1.3 0.0\nBr 2.9 0.4 0.5\nH 3.5 1.6 0.9\n";
         let (_m, _pa, basis, core, _p) = setup(xyz);
         let actual: usize = core
             .pairs

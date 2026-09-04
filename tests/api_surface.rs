@@ -49,9 +49,7 @@ fn readme_correction_variant_table_is_accurate() {
             variant,
             ..Pm3Options::default()
         };
-        run_pm3(&molecule, &parameters, &options)
-            .unwrap()
-            .total_ev
+        run_pm3(&molecule, &parameters, &options).unwrap().total_ev
     };
     let plain = energy(Variant::Pm3);
     let d3 = energy(Variant::Pm3D3);
@@ -289,9 +287,7 @@ fn documented_memory_budgets_do_not_change_results() {
     .unwrap();
 
     assert!((reference.total_ev - squeezed.total_ev).abs() < 1.0e-8);
-    assert!(
-        (reference.heat_of_formation_kcal - squeezed.heat_of_formation_kcal).abs() < 1.0e-6
-    );
+    assert!((reference.heat_of_formation_kcal - squeezed.heat_of_formation_kcal).abs() < 1.0e-6);
     for (a, b) in reference.charges.iter().zip(&squeezed.charges) {
         assert!((a - b).abs() < 1.0e-8, "charge {a} vs {b}");
     }
@@ -375,10 +371,12 @@ fn documented_reference_selection() {
 
     let params = Pm3Parameters::standard().unwrap();
     let closed = Molecule::from_xyz_str(WATER_XYZ, 0.0).unwrap();
-    let radical =
-        Molecule::from_xyz_str("4\nmethyl\nC 0 0 0\nH 0 1.078 0\nH 0.9336 -0.539 0\nH -0.9336 -0.539 0\n", 0.0)
-            .unwrap()
-            .with_multiplicity(2);
+    let radical = Molecule::from_xyz_str(
+        "4\nmethyl\nC 0 0 0\nH 0 1.078 0\nH 0.9336 -0.539 0\nH -0.9336 -0.539 0\n",
+        0.0,
+    )
+    .unwrap()
+    .with_multiplicity(2);
 
     let run = |mol: &Molecule, reference| {
         run_pm3(
@@ -407,7 +405,10 @@ fn documented_reference_selection() {
     let spin = run(&radical, Reference::Auto).unwrap();
     let spin_density = spin.spin_density.expect("UHF must report a spin density");
     let net: f64 = (0..spin_density.rows).map(|i| spin_density[(i, i)]).sum();
-    assert!((net - 1.0).abs() < 1.0e-6, "one unpaired electron, got {net}");
+    assert!(
+        (net - 1.0).abs() < 1.0e-6,
+        "one unpaired electron, got {net}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -691,8 +692,7 @@ fn documented_error_surface() {
     ));
 
     // Missing parameter (titanium has no PM3 block).
-    let titanium =
-        Molecule::from_xyz_str("2\ntih\nTi 0 0 0\nH 1.6 0 0\n", 0.0).unwrap();
+    let titanium = Molecule::from_xyz_str("2\ntih\nTi 0 0 0\nH 1.6 0 0\n", 0.0).unwrap();
     let params = Pm3Parameters::standard().unwrap();
     let missing = run_pm3(&titanium, &params, &Pm3Options::default());
     assert!(matches!(missing, Err(Pm3Error::MissingElement(22))));
@@ -713,4 +713,90 @@ fn documented_error_surface() {
     // Every error type is `std::error::Error` + `Display`, as documented.
     fn assert_is_error<E: std::error::Error>(_: &E) {}
     assert_is_error(&Pm3Error::MissingElement(22));
+}
+
+// ---------------------------------------------------------------------------
+// v0.2.1 additions -- every module whose contents the crate root re-exports
+// ---------------------------------------------------------------------------
+
+/// The new surface is reachable from the crate root, not only from its module.
+///
+/// This file is the one that fails when a documented name is renamed, and it covered none of
+/// the v0.2.1 modules until now: `dipole`, `ir`, `molden` and `pbc::dfpt` were public modules
+/// with nothing re-exported and nothing pinned. Naming each item here is what makes a rename a
+/// compile error rather than a silent break in someone's import.
+#[test]
+fn the_new_modules_are_reachable_from_the_crate_root() {
+    use pm3_rs::pbc::gamma::PeriodicOptions;
+    use pm3_rs::{
+        centre_of_mass, dipole_derivatives, dipole_from_density, dipole_matrix, dynamical_matrix,
+        dynamical_matrix_on_mesh, field_terms, ir_spectrum, molden_string, phonon_frequencies,
+        phonon_frequencies_on_mesh, rigid_ion_dynamical_matrix, Cell, DynamicalMatrix, IrSpectrum,
+        Molecule, Pm3Options, Pm3Parameters, Vec3,
+    };
+
+    let molecule = Molecule::from_xyz_str(WATER_XYZ, 0.0).unwrap();
+    let params = Pm3Parameters::standard().unwrap();
+    let options = Pm3Options::default();
+    let basis = pm3_rs::basis::Basis::build(&molecule, &params).unwrap();
+    let scf = pm3_rs::run_pm3(&molecule, &params, &options).unwrap();
+
+    // Dipole.
+    let com = centre_of_mass(&molecule, &params).unwrap();
+    let matrices = dipole_matrix(&molecule, &params, &basis, com).unwrap();
+    assert_eq!(matrices.len(), 3);
+    let mu = dipole_from_density(&molecule, &params, &basis, &scf.density, com).unwrap();
+    assert!(mu.norm().is_finite());
+    let (_, nuclear) = field_terms(&molecule, &params, &basis, Vec3::new(0.0, 0.0, 0.01)).unwrap();
+    assert!(nuclear.is_finite());
+
+    // Infrared.
+    let derivatives = dipole_derivatives(&molecule, &params, &options).unwrap();
+    assert_eq!(
+        (derivatives.rows, derivatives.cols),
+        (3, 3 * molecule.atoms.len())
+    );
+    let spectrum: IrSpectrum = ir_spectrum(&molecule, &params, &options, 1.0e-3).unwrap();
+    assert_eq!(
+        spectrum.frequencies_cm.len(),
+        spectrum.intensities_km_per_mol.len()
+    );
+
+    // Molden.
+    let document = molden_string(&molecule, &params, &scf).unwrap();
+    assert!(document.contains("[Molden Format]"));
+
+    // Phonons at a wavevector.
+    let mut crystal = molecule.clone();
+    crystal.cell = Some(Cell::cubic(12.0).unwrap());
+    let periodic = PeriodicOptions::default();
+    let q = [0.25, 0.0, 0.0];
+    let rigid: DynamicalMatrix =
+        rigid_ion_dynamical_matrix(&crystal, &params, &options, &periodic, q).unwrap();
+    assert_eq!(rigid.matrix.rows, 3 * crystal.atoms.len());
+    let full = dynamical_matrix(&crystal, &params, &options, &periodic, q).unwrap();
+    assert!(full.hermitian_defect < 1.0e-6);
+    let frequencies = phonon_frequencies(&crystal, &params, &options, &periodic, q).unwrap();
+    assert_eq!(frequencies.len(), 3 * crystal.atoms.len());
+
+    let mesh = pm3_rs::KpointOptions::mesh([1, 1, 1]);
+    let on_mesh =
+        dynamical_matrix_on_mesh(&crystal, &params, &options, &periodic, &mesh, q).unwrap();
+    assert_eq!(on_mesh.matrix.rows, full.matrix.rows);
+    let mesh_frequencies =
+        phonon_frequencies_on_mesh(&crystal, &params, &options, &periodic, &mesh, q).unwrap();
+    assert_eq!(mesh_frequencies.len(), frequencies.len());
+
+    // A caller holding a `DynamicalMatrix` can read frequencies off it without reimplementing
+    // the mass weighting or the sign convention. `phonon_frequencies` is this composed with
+    // `dynamical_matrix`, so the two must agree exactly rather than merely closely -- if they
+    // do not, one of them is weighting by something else.
+    let derived = pm3_rs::frequencies_of(&full).unwrap();
+    assert_eq!(derived, frequencies);
+
+    // The masses are part of the public surface for the same reason: they are the crate's
+    // isotope-averaged values, and nothing else in the API hands them out, so a caller who
+    // wants to mass-weight `D(q)` themselves has no other source for them.
+    assert_eq!(full.masses.len(), crystal.atoms.len());
+    assert!(full.masses[0] > full.masses[1], "oxygen outweighs hydrogen");
 }

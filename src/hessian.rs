@@ -16,7 +16,7 @@
 //! (5 for linear molecules) near-zero modes.
 
 use crate::dual::Scalar;
-use crate::error::Result;
+use crate::error::{Pm3Error, Result};
 use crate::gradient::closed_form_gradient;
 use crate::linalg::{symmetric_eigen, Matrix};
 use crate::math::Vec3;
@@ -32,7 +32,7 @@ static T_PROJ_US: AtomicU64 = AtomicU64::new(0);
 static N_CPHF_ITER: AtomicU64 = AtomicU64::new(0);
 static N_LOC_AOS: AtomicU64 = AtomicU64::new(0);
 
-const MIB: usize = 1024 * 1024;
+pub(crate) const MIB: usize = 1024 * 1024;
 
 fn checked_workspace_bytes(items: &[usize]) -> usize {
     items
@@ -51,7 +51,7 @@ fn hessian_worker_count(options: &Pm3Options, jobs: usize, bytes_per_job: usize)
     available.min((budget / bytes_per_job).max(1)).max(1)
 }
 
-fn cphf_chunk_size(
+pub(crate) fn cphf_chunk_size(
     options: &Pm3Options,
     operation: &'static str,
     ndof: usize,
@@ -117,6 +117,15 @@ pub struct VibrationalModes {
     pub frequencies_cm: Vec<f64>,
     /// Mass-weighted eigenvalues (eV/(Å²·amu)).
     pub eigenvalues: Vec<f64>,
+    /// Normal modes as the **columns** of a `3N × 3N` matrix, in **mass-weighted** coordinates
+    /// and ordered with `frequencies_cm`.
+    ///
+    /// Mass-weighted, not Cartesian: these are the eigenvectors of `H_ij/√(m_i m_j)`, so the
+    /// Cartesian displacement of mode `m` is `l_{im} / √m_i`. Anything contracting a Cartesian
+    /// quantity against a mode — an infrared intensity above all — has to divide by `√m` first,
+    /// and forgetting to is the classic way to get intensities that look plausible and are
+    /// systematically wrong.
+    pub modes: Matrix,
 }
 
 /// Cartesian Hessian (eV/Bohr²) by central differences of the analytic gradient.
@@ -126,7 +135,7 @@ pub struct VibrationalModes {
 /// derivative needs, most visibly for slowly-converging near-degenerate systems (linear
 /// molecules' π shells). Converging the SCF tighter here removes that error (ZnCl₂ 1.8e-5 →
 /// 2.5e-7) while leaving the public energy/gradient tolerances untouched.
-fn tighten_scf_for_hessian(options: &Pm3Options) -> Pm3Options {
+pub(crate) fn tighten_scf_for_hessian(options: &Pm3Options) -> Pm3Options {
     let mut o = options.clone();
     o.e_tol = o.e_tol.min(1.0e-12);
     o.p_tol = o.p_tol.min(1.0e-11);
@@ -301,10 +310,21 @@ pub fn vibrational_analysis(
     for i in 0..ndof {
         for j in 0..ndof {
             let mij = (mass_of(i) * mass_of(j)).sqrt();
-            mw[(i, j)] = hessian[(i, j)] * a0_sq / mij; // eV/(Å²·amu)
+            // A massless atom leaves the row and column at zero rather than at infinity.
+            // MOPAC's special codes `+` (Z = 104) and `--` (Z = 106) are point charges with a
+            // tabulated mass of exactly 0.000, `symbol_to_z` accepts both from a plain XYZ line,
+            // and `tests/api_surface.rs` asserts they are supported — so this divided by zero on
+            // an input the crate advertises. The two sibling mass-weightings
+            // (`pbc::hessian::frequencies` and `pbc::dfpt::frequencies_of`) have always guarded
+            // it this way; only this one did not.
+            mw[(i, j)] = if mij > 0.0 {
+                hessian[(i, j)] * a0_sq / mij // eV/(Å²·amu)
+            } else {
+                0.0
+            };
         }
     }
-    let (eigs, _vecs) = symmetric_eigen(&mw)?;
+    let (eigs, modes) = symmetric_eigen(&mw)?;
     let frequencies_cm: Vec<f64> = eigs
         .iter()
         .map(|&lam| {
@@ -320,6 +340,7 @@ pub fn vibrational_analysis(
         hessian,
         frequencies_cm,
         eigenvalues: eigs,
+        modes,
     })
 }
 
@@ -414,6 +435,7 @@ fn analytic_hessian_core(
         &basis,
         params,
         crate::scf::pair_cache_limit(options),
+        options.field,
     )?;
     let p = scf.density.clone();
     let c = scf.mo_coeff.clone();
@@ -615,7 +637,16 @@ fn analytic_hessian_core(
                         r_off,
                     ),
                     _ => cphf_ov(
-                        &gov[b], &denom, &cv, &co, molecule, params, &basis, &core, None,
+                        &gov[b],
+                        &denom,
+                        &cv,
+                        &co,
+                        molecule,
+                        params,
+                        &basis,
+                        &core,
+                        None,
+                        CPHF_ITERATIONS,
                     ),
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -660,7 +691,7 @@ fn analytic_hessian_core(
 }
 
 /// Copy `count` columns of `c` starting at `start` into a fresh `nao × count` matrix.
-fn submatrix_cols(c: &Matrix, start: usize, count: usize) -> Matrix {
+pub(crate) fn submatrix_cols(c: &Matrix, start: usize, count: usize) -> Matrix {
     let nao = c.rows;
     let mut m = Matrix::zeros(nao, count);
     for mu in 0..nao {
@@ -673,7 +704,7 @@ fn submatrix_cols(c: &Matrix, start: usize, count: usize) -> Matrix {
 
 /// Orbital-energy denominators `ε_i − ε_a` (occupied `i`, virtual `a`), as an `n_vir × n_occ`
 /// matrix — the diagonal of the uncoupled orbital Hessian.
-fn ov_denominators(eps: &[f64], n_occ: usize, nvir: usize) -> Matrix {
+pub(crate) fn ov_denominators(eps: &[f64], n_occ: usize, nvir: usize) -> Matrix {
     let mut d = Matrix::zeros(nvir, n_occ);
     for a in 0..nvir {
         for i in 0..n_occ {
@@ -684,7 +715,7 @@ fn ov_denominators(eps: &[f64], n_occ: usize, nvir: usize) -> Matrix {
 }
 
 /// Project an AO-basis matrix `f` onto the MO occupied–virtual block `Cvᵀ F Co` (n_vir × n_occ).
-fn project_ov(f: &Matrix, cv: &Matrix, co: &Matrix) -> Matrix {
+pub(crate) fn project_ov(f: &Matrix, cv: &Matrix, co: &Matrix) -> Matrix {
     // Sequential: called per-perturbation inside the parallel CPHF loop.
     let m = f.matmul_seq(co); // nao × n_occ
     cv.transpose_matmul_seq(&m) // n_vir × n_occ
@@ -697,7 +728,7 @@ fn project_ov(f: &Matrix, cv: &Matrix, co: &Matrix) -> Matrix {
 /// block, so peak memory is `O(nao²)` (a few transient matrices per thread) rather than
 /// `O(ndof · nao²)`. Each pair's dual integrals are evaluated twice overall (once per endpoint),
 /// a negligible cost next to the CPHF solve.
-fn skeleton_fock_ov(
+pub(crate) fn skeleton_fock_ov(
     molecule: &Molecule,
     params: &Pm3Parameters,
     options: &Pm3Options,
@@ -728,6 +759,23 @@ fn skeleton_fock_ov(
                     Matrix::zeros(nao, nao),
                     Matrix::zeros(nao, nao),
                 ];
+
+                // The external field's derivative. `H_core` carries `+M·f`, whose only geometry
+                // is each atom's own monopole position, so `∂(M·f)[μ_c,μ_c]/∂R_{c,axis} = f_axis`
+                // and every other entry is constant. Small, one-center, and easy to lose: the
+                // loop below is over *pairs*, so a field term added anywhere else would never
+                // reach the response, and the Hessian would quietly drop the cross term
+                // `Tr[(∂P/∂R)(∂H'/∂R)]` while still looking like a converged analytic result.
+                if let Some(field) = options.field {
+                    let offset = basis.atom_offset[c];
+                    let norb = basis.atom_norb[c];
+                    for (axis, component) in field.to_array().iter().enumerate() {
+                        for mu in 0..norb {
+                            fmat[axis][(offset + mu, offset + mu)] += component;
+                        }
+                    }
+                }
+
                 for x in 0..nat {
                     if x == c {
                         continue;
@@ -863,9 +911,14 @@ fn switch_fn(r: f64, r_on: f64, r_off: f64) -> f64 {
 /// Solve the CPHF equations for one perturbation entirely in the MO occ–virt block: iterate
 /// `U = (G_skel + [G(∂P(U))]_ov) / (ε_i − ε_a)` to self-consistency. `G(∂P) = F(∂P) − H_core`
 /// is the two-electron response Fock (the orbital-Hessian coupling); the fixed point is the
-/// coupled response. Returns the converged `U` (n_vir × n_occ).
+/// coupled response. Returns the converged `U` (n_vir × n_occ), or
+/// [`crate::error::Pm3Error::ScfNotConverged`] if it did not converge.
+///
+/// `max_iter` is a parameter rather than the constant it always is in production, so that the
+/// failure path can be reached from a test. A cap that cannot be lowered is a branch that cannot
+/// be exercised, and this one shipped returning a partially converged response for months.
 #[allow(clippy::too_many_arguments)]
-fn cphf_ov(
+pub(crate) fn cphf_ov(
     g_ov: &Matrix,
     denom: &Matrix,
     cv: &Matrix,
@@ -875,6 +928,7 @@ fn cphf_ov(
     basis: &crate::basis::Basis,
     core: &crate::hamiltonian::CoreHamiltonian,
     pair_sw: Option<&[f64]>,
+    max_iter: usize,
 ) -> Result<Matrix> {
     // Uncoupled start: U0 = G / (ε_i − ε_a).
     let elem_div = |num: &Matrix| -> Matrix {
@@ -891,7 +945,14 @@ fn cphf_ov(
     let mut hist_u: Vec<Matrix> = Vec::new();
     let mut hist_e: Vec<Matrix> = Vec::new();
     let max_diis = 8;
-    for _ in 0..100 {
+    let mut converged = false;
+    let mut residual = f64::INFINITY;
+    // `PM3_CPHF_TRACE=1` prints the residual per pass, the way `PM3_DFPT_TRACE` does for the
+    // periodic response. Without it there was no way to tell a fixed point that is converging
+    // slowly from one that has stalled, which is exactly the question the iteration cap turns on.
+    let trace = std::env::var_os("PM3_CPHF_TRACE").is_some();
+    let mut pass = 0usize;
+    for _ in 0..max_iter {
         if prof {
             N_CPHF_ITER.fetch_add(1, Ordering::Relaxed);
         }
@@ -921,8 +982,14 @@ fn cphf_ov(
             *ev -= *ov;
             diff += *ev * *ev;
         }
-        if diff.sqrt() < 1.0e-9 {
+        residual = diff.sqrt();
+        if trace {
+            eprintln!("  cphf iter {pass:4} residual {residual:.6e}");
+        }
+        pass += 1;
+        if residual < CPHF_TOLERANCE {
             u = u_new;
+            converged = true;
             break;
         }
         // DIIS extrapolation: u ← Σ c_i u_new_i minimising Σ c_i e_i, Σ c_i = 1.
@@ -932,7 +999,29 @@ fn cphf_ov(
             hist_u.remove(0);
             hist_e.remove(0);
         }
-        u = cphf_diis(&hist_u, &hist_e).unwrap_or(u_new);
+        match cphf_diis(&hist_u, &hist_e) {
+            Some(mixed) => u = mixed,
+            None => {
+                if trace {
+                    eprintln!(
+                        "  cphf iter {pass:4} DIIS declined (history {})",
+                        hist_u.len()
+                    );
+                }
+                u = u_new;
+            }
+        }
+    }
+    // A fixed point that ran out of passes has not produced a response, and this used to return
+    // whatever it was holding. The caller cannot tell: a partially converged `U` gives a Hessian
+    // with plausible-looking frequencies, an infrared spectrum with plausible-looking
+    // intensities, and no diagnostic anywhere. `pbc::dfpt`'s response already refuses in exactly
+    // this situation; these three did not.
+    if !converged {
+        return Err(Pm3Error::ScfNotConverged {
+            iterations: max_iter,
+            error: residual,
+        });
     }
     Ok(u)
 }
@@ -940,48 +1029,81 @@ fn cphf_ov(
 /// Pulay DIIS extrapolation for the CPHF fixed point: solve `B c = [0,−1]`
 /// (`B_ij = ⟨e_i,e_j⟩`, normalised + ridge-regularised so the near-linearly-dependent
 /// residuals of a stiff fixed point stay solvable) and return `Σ c_i u_i`.
-fn cphf_diis(hist_u: &[Matrix], hist_e: &[Matrix]) -> Option<Matrix> {
+pub(crate) fn cphf_diis(hist_u: &[Matrix], hist_e: &[Matrix]) -> Option<Matrix> {
+    // One channel, expressed through the many-channel form so there is a single implementation
+    // of the B matrix, the ridge and the renormalisation to extrapolate against.
+    let u: Vec<Vec<Matrix>> = hist_u.iter().map(|m| vec![m.clone()]).collect();
+    let e: Vec<Vec<Matrix>> = hist_e.iter().map(|m| vec![m.clone()]).collect();
+    cphf_diis_channels(&u, &e).map(|mut c| c.remove(0))
+}
+
+/// The same extrapolation over **several coupled channels at once**.
+///
+/// The α and β halves of an unrestricted response are one fixed point, not two: they couple
+/// through the total response density in the Coulomb term. Extrapolating them separately would
+/// build each channel's coefficients from a residual that ignores the other, which is a different
+/// (and worse-conditioned) problem. So the inner product runs over the whole list and one set of
+/// coefficients is applied to every channel — the same shape
+/// [`crate::pbc::dfpt`]'s response extrapolation uses for its per-k blocks.
+fn cphf_diis_channels(hist_u: &[Vec<Matrix>], hist_e: &[Vec<Matrix>]) -> Option<Vec<Matrix>> {
     let m = hist_u.len();
     if m < 2 {
         return None;
     }
-    // Normalise by the residual magnitudes (conditions B) then add a tiny ridge.
-    let scale = (0..m)
-        .map(|i| hist_e[i].frobenius_dot(&hist_e[i]).sqrt().max(1e-300))
-        .collect::<Vec<_>>();
-    let dim = m + 1;
-    let mut b = crate::linalg::Matrix::zeros(dim, dim);
-    for i in 0..m {
-        for j in 0..m {
-            let mut v = hist_e[i].frobenius_dot(&hist_e[j]) / (scale[i] * scale[j]);
-            if i == j {
-                v += 1e-10; // Tikhonov ridge against singularity
+    let dot = |a: &[Matrix], b: &[Matrix]| -> f64 {
+        a.iter().zip(b).map(|(x, y)| x.frobenius_dot(y)).sum()
+    };
+    // The coefficients come from [`crate::scf::diis_coeffs_from_gram`] — the same solve the
+    // ground-state SCF and the periodic response already use — rather than from a second
+    // implementation here.
+    //
+    // The second implementation was wrong, and wrong in a way that only a trace would show.
+    // Pulay's problem is "minimise `‖Σ cᵢ eᵢ‖²` subject to `Σ cᵢ = 1`", and it divided `B_ij`
+    // by `sᵢ·sⱼ`, the two residuals' *own* magnitudes. That is not a conditioning transform:
+    // it turns the constraint into `Σ dᵢ/sᵢ = 1` in the rescaled variables, and rescaling the
+    // answer afterwards does not put it back. The shared version divides the whole matrix by
+    // one scalar, which leaves the minimiser untouched — and says so in its own comment.
+    //
+    // What the bespoke copy cost: on water the residual fell for the eight passes it took to
+    // fill the history and then settled onto a constant ratio of 0.892 per pass, which is
+    // exactly the unaccelerated fixed point's spectral radius — a hundred and sixty passes to
+    // cross eight decades, from a method whose entire purpose is not to do that. On the shared
+    // solve the same response converges in **three**.
+    let gram: Vec<Vec<f64>> = (0..m)
+        .map(|i| (0..m).map(|j| dot(&hist_e[i], &hist_e[j])).collect())
+        .collect();
+    let c = crate::scf::diis_coeffs_from_gram(&gram)?;
+    let mut out: Vec<Matrix> = hist_u[0]
+        .iter()
+        .map(|u| crate::linalg::Matrix::zeros(u.rows, u.cols))
+        .collect();
+    for (ci, entry) in c.iter().zip(hist_u) {
+        for (slot, ui) in out.iter_mut().zip(entry) {
+            for (ov, uv) in slot.as_mut_slice().iter_mut().zip(ui.as_slice()) {
+                *ov += *ci * *uv;
             }
-            b[(i, j)] = v;
-        }
-        b[(i, m)] = -1.0;
-        b[(m, i)] = -1.0;
-    }
-    let mut rhs = vec![0.0; dim];
-    rhs[m] = -1.0;
-    let cs = crate::linalg::solve_linear(&b, &rhs).ok()?;
-    // Undo the normalisation and renormalise to Σ c = 1.
-    let mut c: Vec<f64> = (0..m).map(|i| cs[i] / scale[i]).collect();
-    let sum: f64 = c.iter().sum();
-    if !sum.is_finite() || sum.abs() < 1e-300 {
-        return None;
-    }
-    for ci in &mut c {
-        *ci /= sum;
-    }
-    let mut out = crate::linalg::Matrix::zeros(hist_u[0].rows, hist_u[0].cols);
-    for (ci, ui) in c.iter().zip(hist_u) {
-        for (ov, uv) in out.as_mut_slice().iter_mut().zip(ui.as_slice()) {
-            *ov += *ci * *uv;
         }
     }
     Some(out)
 }
+
+/// How many passes a coupled-perturbed fixed point takes before it has failed.
+///
+/// Headroom, not a working limit. Water's response reaches `1e-16` in **three** passes now that
+/// [`cphf_diis`] uses the shared coefficient solve; four hundred is there for a genuinely stiff
+/// system, and a converged solve never approaches it.
+///
+/// It is worth recording what this looked like before, because the cap was the symptom and the
+/// extrapolation was the disease. The limit was one hundred, and the loop `Ok`'d whatever
+/// iterate it was holding when that ran out — so the declared tolerance of `1e-9` was never the
+/// tolerance the solver met. Water stopped at `9.4e-7`. Every analytic Hessian, infrared
+/// intensity and dipole derivative this crate produced was built on a response about three
+/// digits looser than it claimed, and nothing said so. Raising the cap alone would have bought
+/// correctness at 160 passes; fixing the extrapolation bought it at three.
+pub(crate) const CPHF_ITERATIONS: usize = 400;
+
+/// Convergence on the RMS change of the response between passes.
+const CPHF_TOLERANCE: f64 = 1.0e-9;
 
 /// For each atom, the `(other_atom, core.pairs index)` of every two-center pair it
 /// belongs to — lets the local CPHF gather an atom's neighbour pairs in O(1).
@@ -1182,7 +1304,9 @@ fn cphf_ov_local(
     let co_loc_t = co_loc.transpose();
     let cv_loc_t = cv_loc.transpose();
     let prof = std::env::var("PM3_TIMING").is_ok();
-    for _ in 0..100 {
+    let mut converged = false;
+    let mut residual = f64::INFINITY;
+    for _ in 0..CPHF_ITERATIONS {
         if prof {
             N_CPHF_ITER.fetch_add(1, Ordering::Relaxed);
             N_LOC_AOS.fetch_max(n_loc as u64, Ordering::Relaxed);
@@ -1238,8 +1362,10 @@ fn cphf_ov_local(
             *ev -= *ov;
             diff += *ev * *ev;
         }
-        if diff.sqrt() < 1.0e-9 {
+        residual = diff.sqrt();
+        if residual < CPHF_TOLERANCE {
             u = u_new;
+            converged = true;
             break;
         }
         hist_u.push(u_new.clone());
@@ -1249,6 +1375,12 @@ fn cphf_ov_local(
             hist_e.remove(0);
         }
         u = cphf_diis(&hist_u, &hist_e).unwrap_or(u_new);
+    }
+    if !converged {
+        return Err(Pm3Error::ScfNotConverged {
+            iterations: CPHF_ITERATIONS,
+            error: residual,
+        });
     }
     Ok(u)
 }
@@ -1275,6 +1407,7 @@ fn analytic_hessian_uhf(
         &basis,
         params,
         crate::scf::pair_cache_limit(options),
+        options.field,
     )?;
 
     // Spin densities Pα = (P_tot + S)/2, Pβ = (P_tot − S)/2.
@@ -1293,12 +1426,21 @@ fn analytic_hessian_uhf(
         }
     }
     // Recover both spin orbital sets by diagonalizing the converged spin Fock matrices.
+    //
+    // `Pm3Result` now carries the β set as well, but these are not the same orbitals: the stored
+    // ones come from the last iteration's Fock, these from the Fock at the *converged* density.
+    // The two agree to `p_tol`, and a second derivative wants the converged pair — `tighten_scf`
+    // exists for the same reason. So this stays, and the field it made redundant is the electron
+    // count below.
     let fa = build_fock_spin(molecule, &basis, params, &core, &pt, &pa)?;
     let fb = build_fock_spin(molecule, &basis, params, &core, &pt, &pb)?;
     let (eps_a, ca) = symmetric_eigen(&fa)?;
     let (eps_b, cb) = symmetric_eigen(&fb)?;
     let n_alpha = scf.n_occ;
-    let n_beta = scf.n_occ - (options.multiplicity - 1);
+    // Read, not reconstructed. `n_occ − (multiplicity − 1)` re-derives what the SCF already
+    // resolved, and disagrees with it whenever the caller's `multiplicity` is not the one the
+    // SCF actually used.
+    let n_beta = scf.n_beta;
 
     // 1) Skeleton (fixed-density) second derivative — spin-resolved exchange.
     let mut hess = Matrix::zeros(ndof, ndof);
@@ -1440,8 +1582,19 @@ fn analytic_hessian_uhf(
                 .into_par_iter()
                 .map(|t| {
                     ucphf_ov(
-                        &gova[t], &govb[t], &denom_a, &denom_b, &cva, &coa, &cvb, &cob, molecule,
-                        params, &basis, &core,
+                        &gova[t],
+                        &govb[t],
+                        &denom_a,
+                        &denom_b,
+                        &cva,
+                        &coa,
+                        &cvb,
+                        &cob,
+                        molecule,
+                        params,
+                        &basis,
+                        &core,
+                        CPHF_ITERATIONS,
                     )
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -1482,7 +1635,7 @@ fn analytic_hessian_uhf(
 /// differs — `Kα(Pα)` into the α Fock, `Kβ(Pβ)` into the β Fock. Built one atom at a time and
 /// projected to each spin's occ–virt block (peak memory `O(nao²)`).
 #[allow(clippy::too_many_arguments)]
-fn skeleton_fock_ov_spin(
+pub(crate) fn skeleton_fock_ov_spin(
     molecule: &Molecule,
     params: &Pm3Parameters,
     options: &Pm3Options,
@@ -1522,6 +1675,21 @@ fn skeleton_fock_ov_spin(
                     Matrix::zeros(nao, nao),
                     Matrix::zeros(nao, nao),
                 ];
+                // The external field's derivative, into **both** channels. The restricted twin
+                // of this block carries the note about why it has to live in the skeleton rather
+                // than in a one-centre loop of its own; the reasoning applies once per spin. The
+                // field couples to charge and not to spin, so each channel gets the same term
+                // rather than a halved one — halving it here is the shape the mistake would take.
+                if let Some(field) = options.field {
+                    let offset = basis.atom_offset[c];
+                    let norb = basis.atom_norb[c];
+                    for (axis, component) in field.to_array().iter().enumerate() {
+                        for mu in 0..norb {
+                            fa[axis][(offset + mu, offset + mu)] += component;
+                            fb[axis][(offset + mu, offset + mu)] += component;
+                        }
+                    }
+                }
                 for x in 0..nat {
                     if x == c {
                         continue;
@@ -1650,7 +1818,7 @@ fn skeleton_fock_ov_spin(
 /// `Uσ = (Gσ_skel + [J(ΔP_tot) − Kσ(ΔPσ)]_ov) / (εσ_i − εσ_a)` to self-consistency; the α and β
 /// channels couple through the total response density `ΔP_tot = ΔPα + ΔPβ` in the Coulomb term.
 #[allow(clippy::too_many_arguments)]
-fn ucphf_ov(
+pub(crate) fn ucphf_ov(
     ga: &Matrix,
     gb: &Matrix,
     denom_a: &Matrix,
@@ -1663,6 +1831,7 @@ fn ucphf_ov(
     params: &Pm3Parameters,
     basis: &crate::basis::Basis,
     core: &crate::hamiltonian::CoreHamiltonian,
+    max_iter: usize,
 ) -> Result<(Matrix, Matrix)> {
     let div = |num: &Matrix, denom: &Matrix| -> Matrix {
         let mut u = num.clone();
@@ -1673,7 +1842,17 @@ fn ucphf_ov(
     };
     let mut ua = div(ga, denom_a);
     let mut ub = div(gb, denom_b);
-    for _ in 0..100 {
+    // The same Pulay extrapolation the restricted solver has had all along. It was written there
+    // because "semiempirical CPHF is stiff otherwise", and this is the *harder* problem — an
+    // open shell with small α/β gaps and near-degenerate frontier orbitals — so the unaccelerated
+    // iteration here was the one most likely to run out of passes, and (before the check below)
+    // to do it silently.
+    let mut hist_u: Vec<Vec<Matrix>> = Vec::new();
+    let mut hist_e: Vec<Vec<Matrix>> = Vec::new();
+    let max_diis = 8;
+    let mut converged = false;
+    let mut residual = f64::INFINITY;
+    for _ in 0..max_iter {
         let dpa = ao_response_density_w(&ua, cva, coa, 1.0);
         let dpb = ao_response_density_w(&ub, cvb, cob, 1.0);
         let mut dpt = dpa.clone();
@@ -1701,18 +1880,48 @@ fn ucphf_ov(
         }
         let ua_new = div(&rhs_a, denom_a);
         let ub_new = div(&rhs_b, denom_b);
+        let mut err_a = ua_new.clone();
+        let mut err_b = ub_new.clone();
         let mut diff = 0.0;
-        for (nv, ov) in ua_new.as_slice().iter().zip(ua.as_slice()) {
-            diff += (nv - ov) * (nv - ov);
+        for (ev, ov) in err_a.as_mut_slice().iter_mut().zip(ua.as_slice()) {
+            *ev -= *ov;
+            diff += *ev * *ev;
         }
-        for (nv, ov) in ub_new.as_slice().iter().zip(ub.as_slice()) {
-            diff += (nv - ov) * (nv - ov);
+        for (ev, ov) in err_b.as_mut_slice().iter_mut().zip(ub.as_slice()) {
+            *ev -= *ov;
+            diff += *ev * *ev;
         }
-        ua = ua_new;
-        ub = ub_new;
-        if diff.sqrt() < 1.0e-9 {
+        residual = diff.sqrt();
+        if residual < CPHF_TOLERANCE {
+            ua = ua_new;
+            ub = ub_new;
+            converged = true;
             break;
         }
+        // Both channels extrapolate on one set of coefficients: they are one coupled fixed
+        // point, not two independent ones.
+        hist_u.push(vec![ua_new.clone(), ub_new.clone()]);
+        hist_e.push(vec![err_a, err_b]);
+        if hist_u.len() > max_diis {
+            hist_u.remove(0);
+            hist_e.remove(0);
+        }
+        match cphf_diis_channels(&hist_u, &hist_e) {
+            Some(mut mixed) => {
+                ub = mixed.remove(1);
+                ua = mixed.remove(0);
+            }
+            None => {
+                ua = ua_new;
+                ub = ub_new;
+            }
+        }
+    }
+    if !converged {
+        return Err(Pm3Error::ScfNotConverged {
+            iterations: max_iter,
+            error: residual,
+        });
     }
     Ok((ua, ub))
 }
@@ -1738,6 +1947,230 @@ fn component(v: &Vec3, k: usize) -> f64 {
 mod tests {
     use super::*;
     use crate::optimizer::{optimize, OptOptions};
+
+    /// A massless atom does not turn the frequencies into `NaN`.
+    ///
+    /// MOPAC's sparkle codes carry a tabulated mass of exactly zero, `symbol_to_z` accepts them
+    /// from an ordinary XYZ line, and `tests/api_surface.rs` asserts they are supported — so
+    /// `pm3-rs frequencies` on a geometry containing one divided by zero and returned `inf`
+    /// wherever that atom appeared. Both sibling mass-weightings guarded it; this one did not.
+    #[test]
+    fn a_massless_atom_does_not_poison_the_frequencies() {
+        let params = Pm3Parameters::standard().unwrap();
+        // A water molecule with a `+` point charge sitting off to one side.
+        // Charge `+1`, because the sparkle carries a `+1` core charge and no orbitals: at
+        // neutrality the cell would hold nine electrons, which no singlet can.
+        let molecule = Molecule::from_xyz_str(
+            "4\nwater and a sparkle\nO 0.0 0.0 0.1173\nH 0.0 0.7572 -0.4692\n\
+             H 0.0 -0.7572 -0.4692\n+ 0.0 0.0 4.0\n",
+            1.0,
+        )
+        .unwrap();
+        // Non-vacuity: the tabulated mass really is zero, which is what makes this a division
+        // by zero rather than a merely small denominator.
+        assert_eq!(params.element(104).unwrap().mass, 0.0);
+
+        let options = Pm3Options {
+            charge: 1.0,
+            ..Pm3Options::default()
+        };
+        let vib = vibrational_analysis(&molecule, &params, &options, 1.0e-3)
+            .expect("a sparkle is a supported atom");
+        assert!(
+            vib.frequencies_cm.iter().all(|f| f.is_finite()),
+            "non-finite frequencies: {:?}",
+            vib.frequencies_cm
+        );
+        assert!(vib.eigenvalues.iter().all(|e| e.is_finite()));
+    }
+
+    /// A coupled-perturbed solve that runs out of passes is an error, not an answer.
+    ///
+    /// Both solvers used to fall out of their loop and `Ok` whatever iterate they were holding.
+    /// Nothing downstream could tell: a partially converged `U` gives a Hessian with plausible
+    /// frequencies and an infrared spectrum with plausible intensities. It was not hypothetical
+    /// — water's own response stops at `9.4e-7` after the hundred passes the cap used to allow,
+    /// against a declared tolerance of `1e-9`, so *every* analytic Hessian this crate produced
+    /// was built on a response three digits looser than it claimed.
+    ///
+    /// Driven at `max_iter = 1` because a cap that cannot be lowered is a branch that cannot be
+    /// tested, which is how this survived.
+    #[test]
+    fn a_response_that_runs_out_of_passes_is_refused() {
+        let params = Pm3Parameters::standard().unwrap();
+        let molecule = Molecule::from_xyz_str(
+            "3\nwater\nO 0.0 0.0 0.1173\nH 0.0 0.7572 -0.4692\nH 0.0 -0.7572 -0.4692\n",
+            0.0,
+        )
+        .unwrap();
+        let options = Pm3Options::default();
+        let scf = crate::run_pm3(&molecule, &params, &options).unwrap();
+        let basis = crate::basis::Basis::build(&molecule, &params).unwrap();
+        let core = crate::hamiltonian::build_core(&molecule, &basis, &params).unwrap();
+
+        let n_occ = scf.n_occ;
+        let nvir = basis.nao - n_occ;
+        let cv = submatrix_cols(&scf.mo_coeff, n_occ, nvir);
+        let co = submatrix_cols(&scf.mo_coeff, 0, n_occ);
+        let denom = ov_denominators(&scf.mo_energies, n_occ, nvir);
+        let gov =
+            skeleton_fock_ov(&molecule, &params, &options, &basis, &scf.density, &cv, &co).unwrap();
+
+        let one_pass = cphf_ov(
+            &gov[0], &denom, &cv, &co, &molecule, &params, &basis, &core, None, 1,
+        );
+        match one_pass {
+            Err(crate::error::Pm3Error::ScfNotConverged { iterations, error }) => {
+                assert_eq!(iterations, 1);
+                assert!(error > CPHF_TOLERANCE, "refused while inside tolerance");
+            }
+            Err(other) => panic!("wrong error: {other}"),
+            Ok(_) => panic!("one pass cannot converge a stiff fixed point, and it said it did"),
+        }
+
+        // The production cap does converge it — which is the other half of the claim, and the
+        // half that says 400 is enough rather than merely larger than 100.
+        let converged = cphf_ov(
+            &gov[0],
+            &denom,
+            &cv,
+            &co,
+            &molecule,
+            &params,
+            &basis,
+            &core,
+            None,
+            CPHF_ITERATIONS,
+        )
+        .expect("the production cap converges water's response");
+        assert_eq!(converged.rows, nvir);
+        assert_eq!(converged.cols, n_occ);
+
+        // And it converges *fast*, which is the part a correctness check alone would not catch.
+        //
+        // The extrapolation used to normalise each residual by its own magnitude, which solves a
+        // different constrained problem than Pulay's. The answer was still the right fixed point
+        // — every finite-difference test passed — so nothing failed; the iteration simply fell
+        // back to the unaccelerated rate of 0.892 per pass and took 160 of them. Ten passes is
+        // far above the three this needs and far below the 160 the broken extrapolation took, so
+        // it pins the behaviour without pinning the exact count.
+        let fast = cphf_ov(
+            &gov[0], &denom, &cv, &co, &molecule, &params, &basis, &core, None, 10,
+        );
+        assert!(
+            fast.is_ok(),
+            "ten passes should be plenty; the extrapolation is not accelerating"
+        );
+        let quick = fast.unwrap();
+        let drift = quick
+            .as_slice()
+            .iter()
+            .zip(converged.as_slice())
+            .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+        assert!(
+            drift < 1.0e-8,
+            "the ten-pass and the full solve disagree by {drift:.3e}; extrapolation must change \
+             the path to the fixed point, not the fixed point"
+        );
+    }
+
+    /// The open-shell response is extrapolated too, and refuses the same way.
+    ///
+    /// `ucphf_ov` was a bare fixed-point iteration while its restricted twin had Pulay DIIS —
+    /// written there because "semiempirical CPHF is stiff otherwise". So the acceleration was
+    /// missing from the *harder* of the two problems.
+    #[test]
+    fn the_open_shell_response_is_accelerated_and_refuses_when_it_must() {
+        const METHYL: &str = "4\nmethyl\nC 0.0 0.0 0.0\nH 1.0787 0.0 0.0\n\
+                              H -0.5393 0.9341 0.0\nH -0.5393 -0.9341 0.0\n";
+        let params = Pm3Parameters::standard().unwrap();
+        let molecule = Molecule::from_xyz_str(METHYL, 0.0)
+            .unwrap()
+            .with_multiplicity(2);
+        let options = Pm3Options {
+            multiplicity: 2,
+            reference: crate::Reference::Uhf,
+            ..Pm3Options::default()
+        };
+        let scf = crate::run_pm3(&molecule, &params, &options).unwrap();
+        let basis = crate::basis::Basis::build(&molecule, &params).unwrap();
+        let core = crate::hamiltonian::build_core(&molecule, &basis, &params).unwrap();
+
+        let (n_alpha, n_beta) = (scf.n_occ, scf.n_beta);
+        let (nva, nvb) = (basis.nao - n_alpha, basis.nao - n_beta);
+        let cva = submatrix_cols(&scf.mo_coeff, n_alpha, nva);
+        let coa = submatrix_cols(&scf.mo_coeff, 0, n_alpha);
+        let beta_coeff = scf
+            .mo_coeff_beta
+            .as_ref()
+            .expect("an unrestricted result has beta MOs");
+        let beta_energies = scf
+            .mo_energies_beta
+            .as_ref()
+            .expect("an unrestricted result has beta energies");
+        let cvb = submatrix_cols(beta_coeff, n_beta, nvb);
+        let cob = submatrix_cols(beta_coeff, 0, n_beta);
+        let denom_a = ov_denominators(&scf.mo_energies, n_alpha, nva);
+        let denom_b = ov_denominators(beta_energies, n_beta, nvb);
+
+        let spin = scf.spin_density.as_ref().expect("unrestricted");
+        let mut pa = scf.density.clone();
+        let mut pb = scf.density.clone();
+        for ((a, b), (t, s)) in pa
+            .as_mut_slice()
+            .iter_mut()
+            .zip(pb.as_mut_slice().iter_mut())
+            .zip(scf.density.as_slice().iter().zip(spin.as_slice()))
+        {
+            *a = 0.5 * (t + s);
+            *b = 0.5 * (t - s);
+        }
+        let (gova, govb) = skeleton_fock_ov_spin(
+            &molecule,
+            &params,
+            &options,
+            &basis,
+            &scf.density,
+            &pa,
+            &pb,
+            &cva,
+            &coa,
+            &cvb,
+            &cob,
+        )
+        .unwrap();
+
+        let one_pass = ucphf_ov(
+            &gova[0], &govb[0], &denom_a, &denom_b, &cva, &coa, &cvb, &cob, &molecule, &params,
+            &basis, &core, 1,
+        );
+        assert!(
+            matches!(
+                one_pass,
+                Err(crate::error::Pm3Error::ScfNotConverged { .. })
+            ),
+            "one pass cannot converge the coupled alpha/beta fixed point"
+        );
+
+        let (ua, ub) = ucphf_ov(
+            &gova[0],
+            &govb[0],
+            &denom_a,
+            &denom_b,
+            &cva,
+            &coa,
+            &cvb,
+            &cob,
+            &molecule,
+            &params,
+            &basis,
+            &core,
+            CPHF_ITERATIONS,
+        )
+        .expect("the production cap converges the methyl radical's response");
+        assert_eq!((ua.rows, ua.cols), (nva, n_alpha));
+        assert_eq!((ub.rows, ub.cols), (nvb, n_beta));
+    }
 
     #[test]
     fn cphf_batch_respects_memory_budget() {
@@ -2024,6 +2457,104 @@ mod tests {
         assert!(
             six_low_max < 300.0,
             "trans/rot not near zero: {six_low_max}"
+        );
+    }
+    /// The analytic Hessian in a field, against a finite difference of the analytic gradient.
+    ///
+    /// The field contributes nothing to the *skeleton*: it is linear in the nuclear coordinates,
+    /// so its second derivative at fixed density vanishes identically. Everything it does to the
+    /// Hessian comes through the response, and reaches it only because `skeleton_fock_ov` carries
+    /// the field's own first derivative. Leave that out and the result is still symmetric, still
+    /// has six near-zero modes, and is wrong by the cross term.
+    ///
+    /// Both spin paths are exercised. The open-shell case is not decoration: `skeleton_fock_ov`
+    /// and `skeleton_fock_ov_spin` are separate functions, so wiring the field into one of them
+    /// leaves the other silently short of exactly the cross term described above — and a
+    /// closed-shell test cannot see it.
+    #[test]
+    fn the_hessian_in_a_field_matches_finite_differences() {
+        for (xyz, multiplicity) in [
+            (
+                "3\nwater\nO 0.0 0.0 0.1173\nH 0.0 0.7572 -0.4692\nH 0.0 -0.7572 -0.4692\n",
+                1_usize,
+            ),
+            (
+                "4\nmethyl\nC 0.0 0.0 0.05\nH 1.09 0.0 0.0\nH -0.545 0.944 0.0\nH -0.545 -0.944 0.0\n",
+                2,
+            ),
+        ] {
+            the_field_hessian_case(xyz, multiplicity);
+        }
+    }
+
+    fn the_field_hessian_case(xyz: &str, multiplicity: usize) {
+        let params = Pm3Parameters::standard().unwrap();
+        let molecule = Molecule::from_xyz_str(xyz, 0.0).unwrap();
+        let field = crate::math::Vec3::new(0.018, -0.011, 0.026);
+        let options = Pm3Options {
+            e_tol: 1.0e-12,
+            p_tol: 1.0e-11,
+            max_scf: 500,
+            field: Some(field),
+            multiplicity,
+            ..Default::default()
+        };
+
+        let analytic = analytic_hessian(&molecule, &params, &options, 5.0e-4).unwrap();
+        let ndof = 3 * molecule.atoms.len();
+        let step = 1.0e-4;
+        let mut numeric = Matrix::zeros(ndof, ndof);
+        for dof in 0..ndof {
+            let gradient_at = |sign: f64| {
+                let mut shifted = molecule.clone();
+                let mut delta = [0.0; 3];
+                delta[dof % 3] = sign * step;
+                shifted.atoms[dof / 3].position +=
+                    crate::math::Vec3::new(delta[0], delta[1], delta[2]);
+                crate::gradient::closed_form_gradient(&shifted, &params, &options)
+                    .unwrap()
+                    .gradient
+            };
+            let (plus, minus) = (gradient_at(1.0), gradient_at(-1.0));
+            for other in 0..ndof {
+                let p = plus[other / 3].to_array()[other % 3];
+                let m = minus[other / 3].to_array()[other % 3];
+                numeric[(other, dof)] = (p - m) / (2.0 * step);
+            }
+        }
+
+        let mut worst = 0.0_f64;
+        for i in 0..ndof {
+            for j in 0..ndof {
+                worst = worst.max((analytic[(i, j)] - numeric[(i, j)]).abs());
+            }
+        }
+        assert!(
+            worst < 2.0e-4,
+            "the field Hessian differs from finite differences by {worst:.3e} eV/Bohr^2"
+        );
+
+        // And the field genuinely moved it, so the agreement is not agreement on the field-free
+        // Hessian.
+        let without = analytic_hessian(
+            &molecule,
+            &params,
+            &Pm3Options {
+                field: None,
+                ..options.clone()
+            },
+            5.0e-4,
+        )
+        .unwrap();
+        let mut moved = 0.0_f64;
+        for i in 0..ndof {
+            for j in 0..ndof {
+                moved = moved.max((analytic[(i, j)] - without[(i, j)]).abs());
+            }
+        }
+        assert!(
+            moved > 1.0e-3,
+            "the field barely moved the Hessian ({moved:.3e})"
         );
     }
 }
