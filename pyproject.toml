@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pm3-rs-python"
-version = "0.2.3"
+version = "0.2.5"
 description = "PM3 semiempirical method with periodic boundary conditions, divide-and-conquer, a Python-native API and an ASE calculator"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -14,7 +14,23 @@ dependencies = ["numpy>=1.21"]
 # PEP 639: an SPDX expression plus the files it refers to, rather than the
 # deprecated `license = { text = ... }` table.
 license = "GPL-3.0-or-later"
-license-files = ["LICENSE"]
+# The wheel used to carry LICENSE alone, and that was not enough. `_native.pyd` has the
+# PM3 parameter tables `include_str!`-ed into it at compile time, and those tables are
+# generated from Apache-2.0 MOPAC -- so the wheel redistributes Apache-2.0 material to
+# people who never see this repository. Apache-2.0 section 4(a) wants them to get the
+# license text with it, and 4(b) the attribution. `cargo package` carried all of this
+# already; only the wheel dropped it, which is the copy most users actually install.
+# `LICENSES.txt` is the Rust dependency graph's texts: ~60 crates, mostly MIT, all of them
+# statically linked into `_native.pyd`. MIT asks for the copyright notice to travel with
+# substantial portions of the software, and a static binary is one.
+license-files = [
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "third_party/README.md",
+    "third_party/*/LICENSE",
+    "third_party/*/NOTICE",
+    "third_party/rust-crates/LICENSES.txt",
+]
 
 keywords = [
     "chemistry",
@@ -62,12 +78,20 @@ Issues = "https://github.com/ss0832/pm3-rs/issues"
 [project.optional-dependencies]
 ase = ["ase>=3.22"]
 
+[tool.pytest.ini_options]
+# Registered so that `-m "not slow"` is a supported way to run the suite rather than a
+# typo that silently selects nothing, and so an unregistered-marker warning does not
+# train the reader to ignore warnings.
+markers = [
+    "slow: periodic runs that cost a lattice sum or a response solve; seconds each rather than milliseconds",
+]
+
 [tool.maturin]
 features = ["python"]
 python-source = "python"
 module-name = "pm3_rs._native"
 # The parameter tables are `include_str!`-ed into the binary at compile time, so
-# they do not need to ship in the wheel 窶・but they do need to be in the sdist, or
+# they do not need to ship in the wheel — but they do need to be in the sdist, or
 # a source build has nothing to compile against.
 include = [
     { path = "src/data/*.csv", format = "sdist" },

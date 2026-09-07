@@ -618,6 +618,7 @@ pub fn run_finite_field(
         return Err(Pm3Error::ScfNotConverged {
             iterations,
             error: largest_change,
+            diagnosis: None,
         });
     }
 

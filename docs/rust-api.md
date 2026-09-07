@@ -58,6 +58,36 @@ let options = Pm3Options {
 `Pm3Options` fields: `max_scf`, `e_tol`, `p_tol`, `level_shift_ev`, `damping`,
 and `hessian_cutoff`.
 
+### Which SCF solution you get
+
+The SCF equations have more than one solution, and iteration finds whichever the
+starting density and the accelerator lead to — a converged excited solution obeys
+the aufbau principle among its own eigenvalues and reports itself converged. Two
+options govern this:
+
+```rust
+use pm3_rs::scf::{ScfGuess, ScfStability};
+
+let options = Pm3Options {
+    guess: ScfGuess::Auto,            // Auto (= SAD) | Sad | Core | SymmetryBroken
+    stability: ScfStability::Auto,    // Auto | Off | Always
+    ..Pm3Options::default()
+};
+```
+
+`ScfStability::Auto`, the default, re-solves from other starting points when the
+converged state's frontier gap is under 6 eV and keeps the lowest solution. It
+fires on about 3% of ordinary molecules and is what makes the whole 189-molecule
+MOPAC oracle agree; without it, seven of those molecules come back up to 279
+kcal/mol high. `Pm3Result::scf_paths_tried` and `Pm3Result::scf_improvement_ev`
+report whether it ran and whether it changed the answer.
+
+### `mmok`
+
+`Pm3Options::mmok` (default `false`) adds MOPAC's `MMOK` amide correction. See
+[`python-api.md`](python-api.md) for what it is and why the default differs from
+MOPAC's; from Rust it is a plain boolean rather than a `+mmok` method suffix.
+
 Three soft memory budgets bound the allocations that grow with system size.
 Each reports a `Pm3Error::ResourceLimit` (or degrades) instead of letting the
 allocator abort the process; set one to `0` only when an external memory limit
@@ -130,6 +160,18 @@ the exact analytic D3/H4/X second derivatives for the correction variants. A
 `numerical_hessian` (central differences of the analytic gradient) is available
 as an independent reference. `VibrationalModes { hessian, frequencies_cm,
 eigenvalues }`.
+
+Translations and rotations are removed by **projection**, not by being small: the
+rigid-body subspace is discovered from the geometry — two rotations for a linear
+molecule, none for a single atom — and those modes come back as exactly `0.0`.
+`n_rigid` says how many were found and `rigid_residual_cm` is the largest `|ω|`
+they carried **before** the projection, which is the diagnostic for the Hessian's
+quality rather than a number the projection has already flattened.
+
+`Pm3Options::cphf_max_iter` (default 400) caps the coupled-perturbed solve. It
+was a hard-coded constant, so a stiff response could only be rescued by editing
+the crate; raise it first when a Hessian fails with a large response residual and
+the SCF under it converged cleanly.
 
 ## Geometry optimization (L-BFGS)
 
@@ -315,12 +357,33 @@ pm3_rs_cli frequencies water.xyz --method pm3-d3h4
 pm3_rs_cli phonons     crystal.xyz --cell 10.0                  # Gamma point
 pm3_rs_cli phonons     crystal.xyz --cell 10.0 --q 0.25,0,0     # DFPT at a wavevector
 pm3_rs_cli phonons     crystal.xyz --cell 10.0 --q 0.25,0,0 --rigid-ion
+pm3_rs_cli orbitals    water.xyz --coefficients   # MO energies, occupations, HOMO/LUMO
+pm3_rs_cli molden      water.xyz --output out.molden
+pm3_rs_cli optimize    crystal.xyz --cell 6.0 --pbc xz --relax-cell
+pm3_rs_cli optimize    big.xyz --dc 4.8           # partitioned geometry optimization
 ```
 
 `--q` is in fractions of the reciprocal lattice vectors and needs a `--cell`;
 with `--kpts` the response is summed over that mesh, each point paired with
 `k + q`. `--rigid-ion` reports the fixed-density half of `D(q)` alone, which is
 what a supercell finite difference can be compared against directly.
+
+`--pbc` accepts every spelling of the same thing: `1,0,1`, `101`, `xz`, `x,z`,
+`true,false,true`, and `none` for an isolated cell.
+
+`optimize` on a cell takes `--relax-cell` / `--fixed-cell` (the default, stated),
+`--max-steps`, `--force-tol` (eV/Å), `--stress-tol` (eV/Å³) and `--pressure`.
+Which one ran is printed, because "optimized" without saying what moved is read
+once and misremembered. The saved geometry carries its lattice as extended-XYZ
+`Lattice="..."`, so a variable-cell result is not silently thrown away.
+
+`molden` writes `[GTO]` by default — an even-tempered Gaussian expansion of the
+Slater orbitals, which is what viewers read — and `--sto` writes the exponents PM3
+actually uses instead. `--output` says where the file goes.
+
+`--dc <radius>` runs the partitioned SCF, and works with `energy`, `charges` and
+`optimize`. Every other command refuses it by name rather than quietly returning a
+single point.
 
 Flags: `--charge <q>`, `--multiplicity <m>`, `--method <pm3|pm3-d3|pm3-d3h4|pm3-d3h4x>`,
 `--no-diis`. Coordinates in the XYZ input/output are Ångström.

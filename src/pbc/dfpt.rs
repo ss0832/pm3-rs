@@ -23,7 +23,7 @@
 //! derivative `H`, that becomes four contributions: `+H` on each diagonal block unphased, and
 //! `−H e^{±iq·T}` on the two mixed blocks. Setting `q = 0` collapses this onto the Γ-point
 //! scatter [`crate::pbc::hessian`] already uses, which is what
-//! [`tests::the_dynamical_matrix_reduces_to_the_gamma_hessian`] checks.
+//! `tests::the_dynamical_matrix_reduces_to_the_gamma_hessian` checks.
 //!
 //! # The electronic response
 //!
@@ -49,11 +49,11 @@
 //!
 //! | piece | checked against |
 //! |---|---|
-//! | the perturbation's short-range half | [`crate::pbc::kernel::fock_derivative_pairs`] |
+//! | the perturbation's short-range half | `pbc::kernel::fock_derivative_pairs` |
 //! | its long-range half | the same term by finite differences of the Ewald sum |
 //! | the two-electron kernel | [`crate::pbc::kernel::PeriodicKernel`] |
 //! | the Coulomb second derivative | [`crate::pbc::ewald_hessian::ewald_atom_hessian`] |
-//! | the short-range second derivative | [`crate::pbc::hessian::skeleton`] |
+//! | the short-range second derivative | `pbc::hessian::skeleton` |
 //! | the orbitals the response is built on | the SCF's own |
 //! | `D(0)`, everything together | [`crate::pbc::hessian::periodic_hessian`] |
 //! | `D(q)` at finite `q` | a doubled cell's Γ-point Hessian, by folding |
@@ -128,7 +128,7 @@ pub fn rigid_ion_dynamical_matrix(
         None,
         q_frac,
         false,
-        &DfptOptions::default(),
+        &dfpt_defaults(options),
     )
 }
 
@@ -138,6 +138,23 @@ pub fn rigid_ion_dynamical_matrix(
 /// sampling the ground state used and carries the same condition: see
 /// [`crate::pbc::gamma::PeriodicResult::gamma_margin`], which applies here unchanged, and the
 /// module note.
+/// `DfptOptions` for the entry points that do not take one, carrying across the only knob
+/// `Pm3Options` has that belongs to a response solve.
+///
+/// The convenience entry points here take a `Pm3Options` and nothing else, so a caller who
+/// raises `cphf_max_iter` because a Hessian would not converge expects the same to apply to a
+/// phonon or a Born charge. Without this it did not: those went through `DfptOptions::default()`,
+/// and the argument was accepted and dropped.
+///
+/// This also raises their default cap from `DfptOptions`' 200 to `Pm3Options`' 400. That can only
+/// turn a reported non-convergence into an answer, never the reverse.
+fn dfpt_defaults(options: &Pm3Options) -> DfptOptions {
+    DfptOptions {
+        max_iter: options.cphf_max_iter,
+        ..DfptOptions::default()
+    }
+}
+
 pub fn dynamical_matrix(
     molecule: &Molecule,
     params: &Pm3Parameters,
@@ -153,11 +170,40 @@ pub fn dynamical_matrix(
         None,
         q_frac,
         true,
-        &DfptOptions::default(),
+        &dfpt_defaults(options),
     )
 }
 
 /// The dynamical matrix at `q_frac`, with the response summed over a **k-mesh**.
+///
+/// # ⚠ Known defect — do not trust this yet
+///
+/// **This function is wrong at `q = 0` on a polar crystal**, by an amount that is not small and
+/// does not go away with the mesh. On rocksalt NaCl at `3×3×3` it returns
+/// `diag(−4.61, −1.28, −1.28) eV/Å²` where a central difference of the analytic forces at the
+/// same sampling returns `+2.16` in all three directions: wrong by 300%, anisotropic in a cubic
+/// crystal, and with the sign of the curvature reversed — it calls a stable structure unstable.
+/// The odd diagonal component follows the axis the second atom was *written along*, which no
+/// physical term can do.
+///
+/// [`dynamical_matrix`] — the same code with Γ sampling — is **correct**: it agrees with the same
+/// finite difference to `3.2e-4 eV/Å²` out of `4.19`, and its diagonal is isotropic to `1.4e-8`.
+/// So the defect is in the mesh branch of the response, not in the skeleton, the ground state, or
+/// the perturbation.
+///
+/// Ruled out by measurement, recorded so a fix does not begin by re-deriving it: the converged
+/// ground state is orientation-independent to `5e-13 eV`; the forces are isotropic and
+/// mesh-converged; Fermi smearing from 0 to 0.5 eV moves the anisotropy in the fourth digit;
+/// [`LongRange::Off`] and `PM3_DFPT_NO_BARE_LONG_RANGE` each leave it at half the scale; and it
+/// converges smoothly with mesh size (0% at `1³`, 16% at `2³`, 72% at `3³`, 77% at `7³`) rather
+/// than fluctuating. `tests/pbc_cubic_identities.rs` holds the specification a fix has to meet,
+/// and `examples/cubic_anisotropy.rs` reproduces the bisection.
+///
+/// Until it is fixed, use Γ sampling and check
+/// [`crate::pbc::gamma::PeriodicResult::gamma_margin`], or take the second derivative from finite
+/// differences of [`crate::pbc::kscf::kpoint_gradient`].
+///
+/// # What it is meant to do
 ///
 /// Every point `k` of the mesh is paired with `k + q`, and the mesh is the one the ground state
 /// was converged on — sampling the response more finely than the density would be answering a
@@ -193,7 +239,7 @@ pub fn dynamical_matrix_on_mesh(
         Some(kopt),
         q_frac,
         true,
-        &DfptOptions::default(),
+        &dfpt_defaults(options),
     )
 }
 
@@ -217,6 +263,10 @@ pub fn phonon_frequencies_on_mesh(
 /// Both halves of the dynamical matrix — the fixed-density skeleton and the electronic response
 /// — have to read the *same* density, and the point of this type is that there is one place
 /// where that density comes from. Two SCFs used to be run and only the response used the second.
+// The two variants are different sizes — `KpointResult` carries per-k bands, occupations and the
+// convergence diagnostics — and boxing either would add an allocation to a value that is built
+// once per call and read a handful of times. The size is the cheaper of the two costs here.
+#[allow(clippy::large_enum_variant)]
 enum GroundDensity {
     Gamma(crate::pbc::gamma::PeriodicResult),
     Mesh(crate::pbc::kscf::KpointResult),
@@ -306,6 +356,42 @@ fn assemble(
                         .to_string(),
                 ));
             }
+            // **This is not a metallic DFPT, so a partially occupied cell is refused.**
+            //
+            // The sum-over-states factors below *are* the metallic form,
+            // `(f_n − f_m)/(ε_n − ε_m)` with Fermi–Dirac fillings, which makes it look as
+            // though fractional occupations are handled. Two things are missing and neither
+            // announces itself:
+            //
+            //   * there is no Fermi-level shift `∂ε_F/∂λ`, which a partially occupied cell
+            //     needs at `q → 0` because the perturbation moves states across the chemical
+            //     potential (de Gironcoli, PRB 51, 6773 (1995));
+            //   * the sum skips pairs with `|Δε| < 1e-8` to keep the denominator safe, and on
+            //     a Fermi surface those are precisely the pairs that carry the response.
+            //
+            // So the answer would be quietly incomplete rather than loudly wrong, which is the
+            // worse of the two. Refuse instead.
+            //
+            // Smearing is still allowed, and this is deliberate: what matters is not whether
+            // smearing was *applied* but whether the converged occupations came out integral.
+            // If they did, `T·S` is zero, no state is fractionally filled, there is no Fermi
+            // surface to shift, and the smeared fixed-point equations are the strict-filling
+            // ones — so the response is the one that was asked for. The electronic entropy is
+            // the certificate, the same one `run_kpoints` uses to decide whether its own
+            // smearing rescue changed the answer.
+            if converged.entropy_ts_ev.abs() > crate::pbc::kscf::INTEGRAL_OCCUPATION_ENTROPY_EV {
+                return Err(Pm3Error::InvalidInput(format!(
+                    "the converged cell has fractional occupations (electronic entropy \
+                     T·S = {:.3e} eV), and this response is not a metallic DFPT: it carries \
+                     the (f_n − f_m)/(ε_n − ε_m) occupation factors but not the Fermi-level \
+                     shift a partially filled band needs, and it skips the near-degenerate \
+                     pairs that carry the Fermi-surface term. It would return an incomplete \
+                     response without saying so, so it refuses instead. A gapped cell reaches \
+                     integral occupations at any smearing small against its gap — lower \
+                     KpointOptions::smearing_ev until T·S vanishes, and this will run.",
+                    converged.entropy_ts_ev
+                )));
+            }
             GroundDensity::Mesh(converged)
         }
     };
@@ -338,6 +424,17 @@ fn assemble(
         None => vec![(density, 0.5)],
     };
 
+    // A meshed ground state knows `P(T)` for every image and the skeleton needs it. The image
+    // list is the geometry's, so it is built once here whether or not the response follows.
+    let skeleton_setup = match &ground_state {
+        GroundDensity::Mesh(_) => Some(crate::pbc::gamma::build_setup(molecule, params, periodic)?),
+        GroundDensity::Gamma(_) => None,
+    };
+    let images = match (&ground_state, &skeleton_setup) {
+        (GroundDensity::Mesh(converged), Some(setup)) => Some((converged, setup.images.as_slice())),
+        _ => None,
+    };
+
     let mut matrix = CMatrix::zeros(ndof, ndof);
     phased_skeleton(
         molecule,
@@ -348,6 +445,7 @@ fn assemble(
         &exchange,
         &basis,
         q_frac,
+        images,
         &mut matrix,
     )?;
     // The fixed-charge long-range half. `LongRange::Off` drops it here *and* in the response, so
@@ -468,6 +566,19 @@ pub fn phonon_frequencies(
 /// reimplement the mass weighting and the sign convention to read frequencies off it. The matrix
 /// carries the masses it was indexed by, so this needs nothing else.
 pub fn frequencies_of(d: &DynamicalMatrix) -> Result<Vec<f64>> {
+    Ok(modes_of(d)?.0)
+}
+
+/// Frequencies (cm⁻¹) **and** the polarization vectors that go with them.
+///
+/// Column `m` of the returned matrix is mode `m`'s displacement pattern in **mass-weighted**
+/// coordinates, complex because at a general `q` the atoms in a cell move with a relative phase.
+/// The Cartesian displacement of atom `a` is its three rows divided by `sqrt(masses[a])`.
+///
+/// [`frequencies_of`] is this with the eigenvectors dropped, which is what it used to do
+/// unconditionally — leaving a phonon calculation able to report how fast a mode vibrates and not
+/// what moves in it.
+pub fn modes_of(d: &DynamicalMatrix) -> Result<(Vec<f64>, CMatrix)> {
     let ndof = d.matrix.rows;
     // eV/Bohr² → eV/(Å²·amu), the units the cm⁻¹ conversion is defined against.
     let per_angstrom_squared =
@@ -481,8 +592,8 @@ pub fn frequencies_of(d: &DynamicalMatrix) -> Result<Vec<f64>> {
             }
         }
     }
-    let (eigenvalues, _) = crate::cmatrix::hermitian_eigen(&weighted)?;
-    Ok(eigenvalues
+    let (eigenvalues, modes) = crate::cmatrix::hermitian_eigen(&weighted)?;
+    let frequencies = eigenvalues
         .iter()
         .map(|value| {
             let magnitude = value.abs().sqrt() * crate::hessian::SQRT_EV_PER_ANG2_AMU_TO_CM;
@@ -492,7 +603,8 @@ pub fn frequencies_of(d: &DynamicalMatrix) -> Result<Vec<f64>> {
                 magnitude
             }
         })
-        .collect())
+        .collect();
+    Ok((frequencies, modes))
 }
 
 /// Add a pair's `3×3` block to the four places it belongs, with the phase the image carries.
@@ -522,6 +634,13 @@ fn phased_skeleton(
     exchange: &[(&crate::linalg::Matrix, f64)],
     basis: &Basis,
     q_frac: [f64; 3],
+    // The meshed ground state and the image list its `P(T)` blocks are indexed by, or `None` for
+    // Γ sampling where `P(T) = P(0)` is what the sampling means rather than an assumption laid
+    // over it. See `pair_block`'s `image` argument.
+    images: Option<(
+        &crate::pbc::kscf::KpointResult,
+        &[crate::pbc::gamma::ImageBlock],
+    )>,
     matrix: &mut CMatrix,
 ) -> Result<()> {
     let cell = molecule.cell.expect("checked by the caller");
@@ -539,6 +658,12 @@ fn phased_skeleton(
     let blocks: Vec<Result<(crate::pbc::hessian::PairBlock, [i32; 3])>> = pairs
         .par_iter()
         .map(|pair| {
+            // `P(T)` for this image, where the ground state has one. A pair the image list does
+            // not carry has no `P(T)` block because it is zero there, and `None` then falls back
+            // to `P(0)` — so the lookup is deliberately not an `unwrap`: absent means zero, and
+            // the surrounding tables are already zero at that separation.
+            let image =
+                images.and_then(|(scf, blocks)| scf.density_image(blocks, pair.a, pair.b, pair.t));
             let block = crate::pbc::hessian::pair_block(
                 molecule,
                 params,
@@ -551,6 +676,7 @@ fn phased_skeleton(
                 pair.b,
                 pair.dvec,
                 pair.r,
+                image.as_ref(),
             )?;
             Ok((block, pair.t))
         })
@@ -737,8 +863,15 @@ fn bare_blocks(
     // What the exchange reads, and by how much. The total density at `½` for the single
     // restricted channel, `P^σ` at `1` for each unrestricted one — the same number in the
     // restricted case, and the reason there is one code path rather than two.
-    exchange_density: &crate::linalg::Matrix,
-    exchange_scale: f64,
+    // `P^σ(T)` per image, indexed like `setup.images`, already at the strength the exchange
+    // wants: the Γ path builds it as `exchange_scale · P^σ(0)` and a mesh supplies the real
+    // `P^σ(T)`, so it is used without a further factor.
+    //
+    // This replaced an `exchange_density` matrix and an `exchange_scale`, which between them
+    // could only express `P^σ(0)`. Nothing else here read them, which is why they are gone
+    // rather than kept alongside: two ways to say the same thing, one of which is wrong on a
+    // mesh, is how the bug survived in the skeleton for as long as it did.
+    p_images: &[Vec<f64>],
     q_frac: [f64; 3],
     atom: usize,
     axis: usize,
@@ -904,15 +1037,22 @@ fn bare_blocks(
         }
         if inside_short_range {
             if let Some(slot) = block_index {
+                // `P^σ(T)` for *this* image, not `P^σ(0)` for all of them.
+                //
+                // This read used to be `exchange_scale * exchange_density[(first, second)]`,
+                // which is `P^σ(0)` — the same `P(T) = P(0)` substitution that was wrong in the
+                // skeleton, one level down in the response. It is exact at Γ, where `p_images`
+                // is built as precisely that product, and wrong on a mesh.
+                let stride = setup.images[slot].norb_b;
                 for mu in 0..na {
                     for la in 0..nb {
                         let mut accumulator = 0.0;
                         for nu in 0..na {
                             for si in 0..nb {
                                 let index = pack(mu, nu) * npack_j + pack(la, si);
-                                accumulator += exchange_scale
-                                    * exchange_density[(off_first + nu, off_second + si)]
-                                    * derivative(te.w[index]);
+                                let (row, col) = inter_index(nu, si);
+                                accumulator +=
+                                    p_images[slot][row * stride + col] * derivative(te.w[index]);
                             }
                         }
                         out.images[slot][inter_index(mu, la)] -= inter * accumulator;
@@ -1481,7 +1621,7 @@ fn induced_charges(setup: &crate::pbc::gamma::Setup, delta: &BareBlocks) -> Vec<
         let start = setup.site_offset[ia];
         for mu in 0..n {
             for nu in 0..=mu {
-                // `2 ﾎ捻[ﾎｼ,ﾎｽ]` and `ﾎ捻[ﾎｼ,ﾎｽ] + ﾎ捻[ﾎｽ,ﾎｼ]` are the same number for the ground state,
+                // `2 ΔP[μ,ν]` and `ΔP[μ,ν] + ΔP[ν,μ]` are the same number for the ground state,
                 // whose density is real and symmetric, and they are not the same number here: a
                 // first-order density at finite `q` is complex and has no symmetry between its
                 // two indices. The symmetrized form is the one that makes this the adjoint of
@@ -1551,9 +1691,9 @@ struct GroundState<'a> {
 
 /// One spin channel of the ground state, and everything the response needs to build its own.
 ///
-/// A **restricted** calculation has exactly one of these. Its `exchange_density` is the *total*
-/// density and its `exchange_scale` is `½`, which is the same number as a spin density at full
-/// strength and is what lets one channel stand for two. Each state holds two electrons.
+/// A **restricted** calculation has exactly one of these, at `exchange_scale = ½` against the
+/// total density, which is the same number as a spin density at full strength and is what lets
+/// one channel stand for two. Each state holds two electrons.
 ///
 /// An **unrestricted** calculation has two. Each carries its own `P^σ` at full exchange strength
 /// and holds one electron per state, and the two are coupled only through the Coulomb kernel,
@@ -1562,10 +1702,12 @@ struct GroundState<'a> {
 /// Writing it as a list rather than as a pair of code paths is what keeps the restricted case at
 /// its old cost: it is one channel, not two identical ones, so nothing is diagonalized twice.
 struct SpinChannel {
-    /// What this channel's **exchange** reads, scaled by `exchange_scale`. Coulomb always reads
-    /// [`GroundState::density`] instead.
-    exchange_density: crate::linalg::Matrix,
     /// `½` for the single restricted channel, `1` for each unrestricted one.
+    ///
+    /// Read by the response kernel, which contracts it against the *first-order* density. The
+    /// ground-state exchange density it used to accompany is gone: the only thing that read it
+    /// was the bare perturbation, and reading `P^σ(0)` there was the mesh bug — `p_images` says
+    /// the same thing at Γ and the right thing on a mesh.
     exchange_scale: f64,
     /// Electrons one state holds: `2` restricted, `1` per spin channel.
     occupancy: f64,
@@ -1658,7 +1800,6 @@ fn gamma_ground_state<'a>(
         )?;
         crate::pbc::gamma::add_site_potential(setup, &mut f_onsite, &field);
         Ok(SpinChannel {
-            exchange_density,
             exchange_scale,
             occupancy,
             p_images,
@@ -1739,13 +1880,12 @@ fn mesh_ground_state<'a>(
         (false, Some(homo), Some(lumo)) if lumo > homo => 0.5 * (homo + lumo),
         _ => reported,
     };
-    // The image densities are already per spin, so they are the exchange density this channel
-    // needs at full strength. The on-site exchange reads the same thing as a matrix.
-    let spin_matrix = |images: &crate::pbc::kscf::DensitySet| images.onsite.clone();
+    // The image densities are already per spin, so they are the exchange density each channel
+    // needs at full strength — and since the on-site exchange contracts the *first-order*
+    // density, that is now the only ground-state density the response reads.
     let channels = if scf.unrestricted {
         vec![
             SpinChannel {
-                exchange_density: spin_matrix(potential.p_alpha),
                 exchange_scale: 1.0,
                 occupancy: 1.0,
                 p_images: potential.p_alpha.images.clone(),
@@ -1753,7 +1893,6 @@ fn mesh_ground_state<'a>(
                 fermi_ev: midpoint(scf.fermi_ev),
             },
             SpinChannel {
-                exchange_density: spin_matrix(potential.p_beta),
                 exchange_scale: 1.0,
                 occupancy: 1.0,
                 p_images: potential.p_beta.images.clone(),
@@ -1766,7 +1905,6 @@ fn mesh_ground_state<'a>(
         // diagonalizing twice. Its image densities are still the α ones, because that is what the
         // exchange in `bloch_fock` reads.
         vec![SpinChannel {
-            exchange_density: scf.density.clone(),
             exchange_scale: 0.5,
             occupancy: 2.0,
             p_images: potential.p_alpha.images.clone(),
@@ -1900,8 +2038,7 @@ fn response(
                 periodic,
                 setup,
                 scf.density,
-                &channel.exchange_density,
-                channel.exchange_scale,
+                &channel.p_images,
                 q_frac,
                 atom,
                 axis,
@@ -2268,7 +2405,14 @@ pub(crate) fn phonon_response(
         &mut scratch,
         Some(&mut delta),
         None,
-        &DfptOptions::default(),
+        // Born charges and the dielectric tensor reach this through `Pm3Options`, not through a
+        // `DfptOptions` of their own, so the coupled-perturbed cap has to be carried across here.
+        // Leaving it at the default made `cphf_max_iter` a Python argument that was accepted and
+        // silently dropped on exactly those two entry points.
+        &DfptOptions {
+            max_iter: options.cphf_max_iter,
+            ..DfptOptions::default()
+        },
     )?;
     let basis = Basis::build(molecule, params)?;
     Ok(PhononResponse { scf, basis, delta })
@@ -2384,7 +2528,11 @@ pub(crate) fn field_response(
                     &site_kernel,
                     depth,
                     RESPONSE_TOLERANCE,
-                    RESPONSE_ITERATIONS,
+                    // The electric-field response is a coupled-perturbed solve like any other,
+                    // and it is what the dielectric tensor is built from — so the same cap
+                    // reaches it. It had `RESPONSE_ITERATIONS` hard-coded, which made
+                    // `cphf_max_iter` an argument `dielectric` accepted and ignored.
+                    options.cphf_max_iter,
                 )
             })
             .collect::<Result<_>>()?
@@ -2629,6 +2777,7 @@ fn solve_column(
         return Err(Pm3Error::ScfNotConverged {
             iterations: max_iter,
             error: residual,
+            diagnosis: None,
         });
     }
     Ok(ao)
@@ -2950,7 +3099,6 @@ mod tests {
     /// [`phased_kernel`] reads.
     fn dummy_channel(exchange_scale: f64) -> SpinChannel {
         SpinChannel {
-            exchange_density: crate::linalg::Matrix::zeros(1, 1),
             exchange_scale,
             occupancy: 0.0,
             p_images: Vec::new(),
@@ -2964,6 +3112,139 @@ mod tests {
             max_scf: 400,
             ..Pm3Options::default()
         }
+    }
+
+    /// **Which half of the meshed `D(0)` breaks cubic symmetry: the skeleton or the response.**
+    ///
+    /// `tests/pbc_cubic_identities.rs` records the defect from outside — a meshed `D(0)` on
+    /// rocksalt is anisotropic and disagrees with a finite difference by 300% — but the public
+    /// surface cannot separate the two halves: `rigid_ion_dynamical_matrix` is skeleton-only and
+    /// hardcodes Γ, and every meshed entry point includes the response. `assemble` takes both as
+    /// arguments, so from in here the question is one call each.
+    ///
+    /// The answer decides where a fix goes, and the two candidates predict opposite results:
+    ///
+    /// * If the **response** is at fault (the `k + q` bookkeeping, the occupation factors, the
+    ///   weights), the skeleton is isotropic on a mesh and only the full matrix is not.
+    /// * If the **skeleton** is at fault, it is anisotropic on its own. `phased_skeleton` hands
+    ///   `pair_block` one density matrix for every image `T`, which is the Γ identity
+    ///   `P(T) = P(0)` — exactly right for a Γ ground state and false for a meshed one, where
+    ///   `P(0)` is the Brillouin-zone average and `P(T)` decays with `T`. That would also explain
+    ///   the shape of the error: zero on a `1×1×1` mesh, growing as the mesh resolves `P(0)`
+    ///   away from the Γ value, and saturating once it is resolved.
+    #[test]
+    fn the_meshed_skeleton_is_where_the_cubic_symmetry_breaks() {
+        use crate::pbc::kpoints::KpointSpec;
+        use crate::pbc::kscf::KpointOptions;
+
+        // Rocksalt in its primitive FCC cell, the second atom along x. A cubic crystal has no
+        // axis to prefer, so `D(0)`'s diagonal must not.
+        let a = 5.64 * crate::constants::ANGSTROM_TO_BOHR;
+        let h = a / 2.0;
+        let cell = Cell::new(
+            Vec3::new(0.0, h, h),
+            Vec3::new(h, 0.0, h),
+            Vec3::new(h, h, 0.0),
+            [true; 3],
+        )
+        .unwrap();
+        let mut molecule = Molecule::new(vec![
+            crate::system::Atom {
+                z: 11,
+                position: Vec3::zero(),
+            },
+            crate::system::Atom {
+                z: 17,
+                position: Vec3::new(h, 0.0, 0.0),
+            },
+        ]);
+        molecule.cell = Some(cell);
+
+        let params = Pm3Parameters::standard().unwrap();
+        let periodic = PeriodicOptions::default();
+        let kopt = KpointOptions {
+            spec: KpointSpec::mesh([3, 3, 3]),
+            smearing_ev: 0.05,
+            ..Default::default()
+        };
+        let dfpt = DfptOptions::default();
+
+        let spread_of = |d: &DynamicalMatrix| {
+            let diagonal: Vec<f64> = (0..3).map(|i| d.matrix[(i, i)].re).collect();
+            let hi = diagonal.iter().cloned().fold(f64::MIN, f64::max);
+            let lo = diagonal.iter().cloned().fold(f64::MAX, f64::min);
+            let scale = diagonal
+                .iter()
+                .fold(0.0_f64, |m, v| m.max(v.abs()))
+                .max(1e-12);
+            ((hi - lo) / scale, diagonal)
+        };
+
+        // Skeleton only, Γ sampled: the control. Known good to 0.008% against finite differences.
+        let gamma_skeleton = assemble(
+            &molecule,
+            &params,
+            &options(),
+            &periodic,
+            None,
+            [0.0; 3],
+            false,
+            &dfpt,
+        )
+        .unwrap();
+        let (gamma_spread, gamma_diagonal) = spread_of(&gamma_skeleton);
+
+        // Skeleton only, mesh sampled: the same assembly, the same absent response, and the only
+        // thing that changed is which ground-state density it was handed.
+        let mesh_skeleton = assemble(
+            &molecule,
+            &params,
+            &options(),
+            &periodic,
+            Some(&kopt),
+            [0.0; 3],
+            false,
+            &dfpt,
+        )
+        .unwrap();
+        let (mesh_spread, mesh_diagonal) = spread_of(&mesh_skeleton);
+
+        assert!(
+            gamma_spread < 1.0e-6,
+            "the Γ-sampled skeleton is already anisotropic ({gamma_spread:.3e}, \
+             diag {gamma_diagonal:?}); this test's control is broken and its conclusion means \
+             nothing"
+        );
+
+        assert!(
+            mesh_spread < 1.0e-6,
+            "the meshed skeleton is anisotropic: Γ gives {gamma_diagonal:?} (spread \
+             {gamma_spread:.3e}) and a 3×3×3 mesh gives {mesh_diagonal:?} (spread \
+             {mesh_spread:.3e}), with no electronic response in either. That is the `P(T) = P(0)` \
+             assumption returning — `phased_skeleton` must be handed the mesh's image blocks."
+        );
+
+        // And the other half. Both are now isotropic, which is what closed the defect: the
+        // skeleton was `P(T) = P(0)` in `phased_skeleton`, and the response was the same
+        // substitution in `bare_blocks`' exchange term.
+        let full_mesh = assemble(
+            &molecule,
+            &params,
+            &options(),
+            &periodic,
+            Some(&kopt),
+            [0.0; 3],
+            true,
+            &dfpt,
+        )
+        .unwrap();
+        let (full_spread, full_diagonal) = spread_of(&full_mesh);
+        assert!(
+            full_spread < 1.0e-6,
+            "the full meshed D(0) is anisotropic by {full_spread:.3e} ({full_diagonal:?}) while \
+             its skeleton is isotropic to {mesh_spread:.3e}, so the response has reintroduced the \
+             `P(T) = P(0)` substitution that `bare_blocks` was fixed for"
+        );
     }
 
     /// At `q = 0` the phased matrix must be the Γ-point one, term for term.
@@ -3265,6 +3546,25 @@ mod tests {
             NeighborList::build_from_positions(&positions, molecule.cell.as_ref(), cutoff)
         };
         let index_of = image_index(&setup);
+        // The Γ image densities the restricted channel would carry: `½ P(0)` per image block,
+        // which is what `gamma_ground_state` builds and what this comparison assumes.
+        let p_images: Vec<Vec<f64>> = setup
+            .images
+            .iter()
+            .map(|block| {
+                let (oa, ob) = (
+                    setup.basis.atom_offset[block.a],
+                    setup.basis.atom_offset[block.b],
+                );
+                let mut out = vec![0.0; block.norb_a * block.norb_b];
+                for mu in 0..block.norb_a {
+                    for la in 0..block.norb_b {
+                        out[mu * block.norb_b + la] = 0.5 * scf.density[(oa + mu, ob + la)];
+                    }
+                }
+                out
+            })
+            .collect();
 
         for atom in 0..molecule.atoms.len() {
             for axis in 0..3 {
@@ -3284,9 +3584,9 @@ mod tests {
                     &periodic,
                     &setup,
                     &scf.density,
-                    // The restricted channel: the total density at half exchange strength.
-                    &scf.density,
-                    0.5,
+                    // The restricted channel: the total density at half exchange strength, which
+                    // is what `p_images` above holds.
+                    &p_images,
                     [0.0; 3],
                     atom,
                     axis,
@@ -3898,6 +4198,7 @@ mod tests {
             &[(&scf.density, 0.5)],
             &basis,
             [0.0; 3],
+            None,
             &mut got,
         )
         .unwrap();
@@ -4521,15 +4822,14 @@ mod tests {
                         a.f_onsite[(i, j)],
                         b.f_onsite[(i, j)]
                     );
-                    assert!(
-                        (a.exchange_scale * a.exchange_density[(i, j)]
-                            - b.exchange_scale * b.exchange_density[(i, j)])
-                            .abs()
-                            < 1.0e-7,
-                        "channel {spin} exchange density [{i}][{j}]"
-                    );
                 }
             }
+            // The on-site exchange density used to be compared here as
+            // `exchange_scale · exchange_density`. That field is gone: the bare perturbation was
+            // the only thing that read it, and reading `P^σ(0)` there was the mesh bug. What it
+            // was really asserting — that both paths agree on `P^σ` — is covered by `f_onsite`
+            // above, which is built from it, and by `p_images` below, which is the quantity the
+            // response now actually reads.
             assert_eq!(a.p_images.len(), b.p_images.len(), "image count");
             for (index, (x, y)) in a.p_images.iter().zip(&b.p_images).enumerate() {
                 assert_eq!(x.len(), y.len(), "image {index} block size");

@@ -195,6 +195,110 @@ fn gdf3_lanthanide_sparkle_runs() {
     assert!(r.charges.iter().sum::<f64>().abs() < 1e-6);
 }
 
+/// Every La-Lu Sparkle against MOPAC, at the tolerance they actually reach.
+///
+/// `gdf3_lanthanide_sparkle_runs` above covers one of fifteen, and allows `5e-3 kcal/mol` — which
+/// the sparkle path beats by more than three orders of magnitude. A tolerance that loose is not a
+/// regression test for agreement; it is a regression test for *not being catastrophically wrong*,
+/// and it would sit quietly through a change that moved every lanthanide by a thousandth of a
+/// kcal.
+///
+/// So: all fifteen, at `1e-5`. The fixtures are the exhaustive audit's own
+/// (`tools/oracle/all_element_validation.py`) — neutral trigonal-planar `LnF3` at `r = 2.10 Å` —
+/// and the reference energies are MOPAC v23.2.5's own. The largest deviation across the set is
+/// `3.3e-6 kcal/mol` (CeF3), so `1e-5` is about three times the observed worst case: tight enough
+/// to catch a real change, loose enough not to fail on a different platform's last digit.
+///
+/// The constants below were **re-run against the MOPAC executable**, not copied from
+/// `ALL_ELEMENTS_RESULTS.json` and trusted. A number in a test that agrees with a JSON file that
+/// agrees with a MOPAC run that happened once is not the same as agreeing with MOPAC: nothing in
+/// that chain notices a regenerated fixture or a dropped digit. `tools/oracle/sparkle_oracle.py`
+/// closes it by going back to the executable, and reports the constants here reproducing MOPAC to
+/// `4.9e-11 kcal/mol`.
+///
+/// The geometry must be built with the audit's full-precision `sin(60°)`, not a rounded copy. The
+/// test above uses `1.818653` and lands `1.7e-4 kcal/mol` away from the sweep's value for the
+/// same molecule — a difference in the *fixture*, not in the method, and exactly the kind of
+/// thing that looks like a regression when it is not.
+#[test]
+fn every_lanthanide_sparkle_matches_the_mopac_oracle() {
+    // (Z, symbol, MOPAC v23.2.5 heat of formation, kcal/mol)
+    const ORACLE: [(u8, &str, f64); 15] = [
+        (57, "La", 308.8165760141),
+        (58, "Ce", 455.7459808922),
+        (59, "Pr", 432.5533772791),
+        (60, "Nd", 165.9978745878),
+        (61, "Pm", 174.2617752293),
+        (62, "Sm", 69.7982119301),
+        (63, "Eu", 152.6294139239),
+        (64, "Gd", 61.2555949727),
+        (65, "Tb", 170.2111131818),
+        (66, "Dy", 162.1081459730),
+        (67, "Ho", 83.6642295858),
+        (68, "Er", 13.5285286309),
+        (69, "Tm", 149.6781631169),
+        (70, "Yb", 139.9077771803),
+        (71, "Lu", 98.8177592430),
+    ];
+    // `tools/oracle/all_element_validation.py`: r = 2.10, the two off-axis fluorines at
+    // `sin(60°) = 0.8660254038` times it.
+    const R: f64 = 2.10;
+    const SIN60: f64 = 0.8660254038;
+
+    let mut worst = (0.0_f64, "");
+    let mut failures: Vec<String> = Vec::new();
+
+    for (z, symbol, reference) in ORACLE {
+        let y = SIN60 * R;
+        let xyz = format!(
+            "4\n{symbol}F3 sparkle\n{symbol} 0.0 0.0 0.0\nF {R} 0.0 0.0\n\
+             F {:.10} {y:.10} 0.0\nF {:.10} {:.10} 0.0\n",
+            -0.5 * R,
+            -0.5 * R,
+            -y
+        );
+        let result = hof(&xyz, 0.0, 1);
+        assert!(result.converged, "{symbol}F3 did not converge");
+
+        let deviation = (result.heat_of_formation_kcal - reference).abs();
+        if deviation > worst.0 {
+            worst = (deviation, symbol);
+        }
+        if deviation >= 1.0e-5 {
+            failures.push(format!(
+                "{symbol} (Z={z}): pm3-rs {:.10} vs MOPAC {reference:.10}, off by {deviation:.3e}",
+                result.heat_of_formation_kcal
+            ));
+        }
+
+        // A Sparkle has no valence orbitals, so its Mulliken charge is its core charge exactly,
+        // and the three fluorines share the balance. This is an identity of the model rather than
+        // a fitted number, which is why it gets a far tighter bound than the energy.
+        assert!(
+            (result.charges[0] - 3.0).abs() < 1.0e-9,
+            "{symbol} Sparkle charge is {}, not +3",
+            result.charges[0]
+        );
+        for (index, fluorine) in result.charges[1..].iter().enumerate() {
+            assert!(
+                (fluorine + 1.0).abs() < 1.0e-9,
+                "{symbol}F3 fluorine {index} carries {fluorine}, not -1"
+            );
+        }
+        assert!(result.charges.iter().sum::<f64>().abs() < 1.0e-9);
+    }
+
+    assert!(
+        failures.is_empty(),
+        "sparkles disagreeing with MOPAC by 1e-5 kcal/mol or more:\n  {}",
+        failures.join("\n  ")
+    );
+    eprintln!(
+        "worst Sparkle deviation from MOPAC: {:.3e} kcal/mol ({})",
+        worst.0, worst.1
+    );
+}
+
 #[test]
 fn mopac_point_charges_match_oracle() {
     let plus = "4\nwater plus\nO 0 0 0\nH 0.9584 0 0\nH -0.24 0.9278 0\n+ 0 0 3\n";

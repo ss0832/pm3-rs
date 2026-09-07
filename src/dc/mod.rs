@@ -13,7 +13,7 @@
 //! The density matrix of a system with a gap is **near-sighted**: `P_μν` decays exponentially with
 //! the distance between the orbitals. A subsystem large enough to contain that decay length
 //! reproduces its own core's density to within the truncation, and the pieces reassemble exactly
-//! — see [`partition`] for the weights. The only approximation is that `P_μν` is set to zero for
+//! — see [`fn@partition`] for the weights. The only approximation is that `P_μν` is set to zero for
 //! orbital pairs no single subsystem contains.
 //!
 //! That is also why the buffer radius is the one knob that matters: increasing it must converge

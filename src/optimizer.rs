@@ -50,34 +50,51 @@ pub struct OptResult {
     pub trajectory: Vec<OptStep>,
 }
 
-pub fn optimize(
+/// The result of one energy-and-gradient evaluation, whatever produced it.
+///
+/// `payload` is the caller's own SCF result — a `Pm3Result` for the full diagonalization, a
+/// `DcResult` for the partitioned one — carried through untouched so the driver below never has
+/// to know which it is.
+struct Evaluated<T> {
+    energy_ev: f64,
+    gradient: Vec<Vec3>,
+    max_gradient: f64,
+    heat_of_formation_kcal: f64,
+    payload: T,
+}
+
+/// L-BFGS with a backtracking Armijo line search, over whatever produces the energy and gradient.
+///
+/// Written once and used twice. The full-diagonalization path and the divide-and-conquer path
+/// differ only in which function evaluates a geometry; the two-loop recursion, the curvature
+/// filter, the uphill guard and the step halving are the same optimizer, and a second copy of
+/// them is a second place for the line search to drift.
+///
+/// `energy_only` is the line search's cheaper question — it needs the energy at a trial point and
+/// not the gradient. `None` means that point could not be evaluated, which the search treats as a
+/// rejected step rather than as an error, since the usual cause is a trial geometry far enough
+/// off that the SCF does not settle.
+fn drive<T, E, L>(
     molecule: &Molecule,
-    params: &Pm3Parameters,
-    scf_options: &Pm3Options,
     opt: &OptOptions,
-) -> Result<OptResult> {
+    mut evaluate: E,
+    mut energy_only: L,
+) -> Result<(Molecule, T, bool, usize, Vec<OptStep>)>
+where
+    E: FnMut(&Molecule) -> Result<Evaluated<T>>,
+    L: FnMut(&Molecule) -> Option<f64>,
+{
     let nat = molecule.atoms.len();
     let ndof = 3 * nat;
     let mut mol = molecule.clone();
 
-    // A charged molecule in a uniform field has no minimum: the net force `−Q f` never vanishes,
-    // so the whole thing accelerates down the field forever and the optimizer runs to its
-    // iteration limit against a gradient that never falls. Warn rather than refuse — the run is
-    // legitimate if what is wanted is the trajectory rather than a stationary point.
-    if scf_options.field.is_some() && scf_options.charge != 0.0 {
-        eprintln!(
-            "warning: a net charge of {} in a uniform field feels a constant force, so this \
-             geometry has no minimum to find and the optimization will not converge",
-            scf_options.charge
-        );
-    }
-
     let mut x = flatten(&mol);
-    let grad0 = closed_form_gradient(&mol, params, scf_options)?;
-    let mut g = flatten_grad(&grad0.gradient);
-    let mut energy = grad0.energy_ev;
-    let mut scf = grad0.scf;
-    let mut max_grad = grad0.max_gradient;
+    let first = evaluate(&mol)?;
+    let mut g = flatten_grad(&first.gradient);
+    let mut energy = first.energy_ev;
+    let mut heat = first.heat_of_formation_kcal;
+    let mut payload = first.payload;
+    let mut max_grad = first.max_gradient;
 
     let mut s_hist: Vec<Vec<f64>> = Vec::new();
     let mut y_hist: Vec<Vec<f64>> = Vec::new();
@@ -85,7 +102,7 @@ pub fn optimize(
 
     let mut trajectory = vec![OptStep {
         energy_ev: energy,
-        heat_of_formation_kcal: scf.heat_of_formation_kcal,
+        heat_of_formation_kcal: heat,
         max_gradient: max_grad,
         positions: unflatten(&x),
     }];
@@ -144,8 +161,8 @@ pub fn optimize(
             x_new = x.clone();
             axpy(&mut x_new, step, &d);
             set_positions(&mut mol, &x_new);
-            if let Ok(r) = run_pm3(&mol, params, scf_options) {
-                if r.total_ev <= energy + c1 * step * g_dot_d {
+            if let Some(trial) = energy_only(&mol) {
+                if trial <= energy + c1 * step * g_dot_d {
                     ok = true;
                     break;
                 }
@@ -161,8 +178,8 @@ pub fn optimize(
             break;
         }
 
-        let grad_new = closed_form_gradient(&mol, params, scf_options)?;
-        let g_new = flatten_grad(&grad_new.gradient);
+        let next = evaluate(&mol)?;
+        let g_new = flatten_grad(&next.gradient);
 
         // Update L-BFGS memory.
         let s: Vec<f64> = (0..ndof).map(|i| x_new[i] - x[i]).collect();
@@ -181,27 +198,126 @@ pub fn optimize(
 
         x = x_new;
         g = g_new;
-        energy = grad_new.energy_ev;
-        scf = grad_new.scf;
-        max_grad = grad_new.max_gradient;
+        energy = next.energy_ev;
+        heat = next.heat_of_formation_kcal;
+        payload = next.payload;
+        max_grad = next.max_gradient;
         converged = max_grad < opt.gtol;
 
         trajectory.push(OptStep {
             energy_ev: energy,
-            heat_of_formation_kcal: scf.heat_of_formation_kcal,
+            heat_of_formation_kcal: heat,
             max_gradient: max_grad,
             positions: unflatten(&x),
         });
     }
 
     set_positions(&mut mol, &x);
+    Ok((mol, payload, converged, iterations, trajectory))
+}
+
+/// A charged molecule in a uniform field has no minimum: the net force `−Q f` never vanishes, so
+/// the whole thing accelerates down the field forever and the optimizer runs to its iteration
+/// limit against a gradient that never falls. Warn rather than refuse — the run is legitimate if
+/// what is wanted is the trajectory rather than a stationary point.
+fn warn_if_no_minimum(scf_options: &Pm3Options) {
+    if scf_options.field.is_some() && scf_options.charge != 0.0 {
+        eprintln!(
+            "warning: a net charge of {} in a uniform field feels a constant force, so this \
+             geometry has no minimum to find and the optimization will not converge",
+            scf_options.charge
+        );
+    }
+}
+
+pub fn optimize(
+    molecule: &Molecule,
+    params: &Pm3Parameters,
+    scf_options: &Pm3Options,
+    opt: &OptOptions,
+) -> Result<OptResult> {
+    warn_if_no_minimum(scf_options);
+    let (molecule, scf, converged, iterations, trajectory) = drive(
+        molecule,
+        opt,
+        |mol| {
+            let g = closed_form_gradient(mol, params, scf_options)?;
+            Ok(Evaluated {
+                energy_ev: g.energy_ev,
+                gradient: g.gradient,
+                max_gradient: g.max_gradient,
+                heat_of_formation_kcal: g.scf.heat_of_formation_kcal,
+                payload: g.scf,
+            })
+        },
+        |mol| run_pm3(mol, params, scf_options).ok().map(|r| r.total_ev),
+    )?;
     Ok(OptResult {
-        molecule: mol,
+        molecule,
         scf,
         converged,
         iterations,
         trajectory,
     })
+}
+
+/// A geometry optimization on the **divide-and-conquer** gradient.
+///
+/// The same L-BFGS, over `dc_gradient` instead of the full diagonalization. This exists for the
+/// case `--dc` exists for: a system large enough that a full diagonalization per line-search
+/// trial is not affordable, which is also the case where a geometry optimization is most
+/// expensive and most wanted.
+///
+/// **The density is not variational**, so the usual argument that the first-order energy error
+/// vanishes at the SCF solution does not apply and the gradient carries the partitioning's own
+/// truncation error rather than its square. It converges with `DcOptions::buffer_radius` the same
+/// way the energy does, so a geometry optimized at one buffer should be checked at a wider one
+/// before it is believed — the same caveat `dc_gradient` carries, and it compounds over the
+/// several hundred gradients an optimization takes.
+pub fn optimize_dc(
+    molecule: &Molecule,
+    params: &Pm3Parameters,
+    scf_options: &Pm3Options,
+    dc: &crate::dc::DcOptions,
+    opt: &OptOptions,
+) -> Result<DcOptResult> {
+    warn_if_no_minimum(scf_options);
+    let (molecule, scf, converged, iterations, trajectory) = drive(
+        molecule,
+        opt,
+        |mol| {
+            let g = crate::dc::dc_gradient(mol, params, scf_options, dc)?;
+            Ok(Evaluated {
+                energy_ev: g.energy_ev,
+                gradient: g.gradient,
+                max_gradient: g.max_gradient,
+                heat_of_formation_kcal: g.scf.heat_of_formation_kcal,
+                payload: g.scf,
+            })
+        },
+        |mol| {
+            crate::dc::run_dc(mol, params, scf_options, dc)
+                .ok()
+                .map(|r| r.total_ev)
+        },
+    )?;
+    Ok(DcOptResult {
+        molecule,
+        scf,
+        converged,
+        iterations,
+        trajectory,
+    })
+}
+
+/// [`OptResult`] for a partitioned optimization: the same fields, carrying a [`crate::dc::DcResult`].
+#[derive(Clone, Debug)]
+pub struct DcOptResult {
+    pub molecule: Molecule,
+    pub scf: crate::dc::DcResult,
+    pub converged: bool,
+    pub iterations: usize,
+    pub trajectory: Vec<OptStep>,
 }
 
 fn flatten(mol: &Molecule) -> Vec<f64> {

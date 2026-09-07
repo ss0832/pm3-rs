@@ -26,7 +26,7 @@
 //!
 //! The first term is the atom's own charge moving with it. The other two are the electrons
 //! rearranging, and both come from the coupled-perturbed response
-//! ([`crate::pbc::dfpt::phonon_response`]) — the same response the Γ-point force constants use.
+//! (`pbc::dfpt::phonon_response`) — the same response the Γ-point force constants use.
 //!
 //! # Why this is well defined under periodic boundary conditions when the polarization is not
 //!
@@ -78,7 +78,7 @@ use crate::system::Molecule;
 /// pursuing at the time because the measurement that mattered pointed elsewhere: at the time it
 /// was tried, **85% of a Born-charge run was one long-range lattice sum being recomputed `6N`
 /// times**, and replacing `3N` solves with three changed the wall clock by nothing at all. With
-/// that fixed (see [`crate::pbc::dfpt::LongRangeKernels`]) the solves are what remains, and the
+/// that fixed (see `pbc::dfpt::LongRangeKernels`) the solves are what remains, and the
 /// interchange route is worth about another 3x — for whoever wants it, with the warning that its
 /// contraction is not as obvious as the theorem makes it sound.
 pub fn born_charges(

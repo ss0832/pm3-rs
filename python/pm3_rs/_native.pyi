@@ -47,8 +47,20 @@ def optimize(
     reference: str = ...,
     method: str = ...,
     field: Sequence[float] | None = ...,
+    max_steps: int = ...,
+    force_tol: float | None = ...,
 ) -> dict[str, Any]: ...
 def frequencies(
+    numbers: Sequence[int],
+    positions: Positions,
+    charge: float = ...,
+    multiplicity: int = ...,
+    reference: str = ...,
+    method: str = ...,
+    field: Sequence[float] | None = ...,
+    cphf_max_iter: int | None = ...,
+) -> dict[str, Any]: ...
+def orbitals(
     numbers: Sequence[int],
     positions: Positions,
     charge: float = ...,
@@ -65,6 +77,7 @@ def hessian(
     reference: str = ...,
     method: str = ...,
     field: Sequence[float] | None = ...,
+    cphf_max_iter: int | None = ...,
 ) -> dict[str, Any]: ...
 def periodic_single_point(
     numbers: Sequence[int],
@@ -105,6 +118,7 @@ def phonons(
     kpts: Sequence[int] | None = ...,
     smearing_ev: float = ...,
     lo_to_direction: Sequence[float] | None = ...,
+    cphf_max_iter: int | None = ...,
 ) -> dict[str, Any]: ...
 def bands(
     numbers: Sequence[int],
@@ -150,6 +164,21 @@ def divide_and_conquer(
     long_range_cutoff: float | None = ...,
     field: Sequence[float] | None = ...,
 ) -> dict[str, Any]: ...
+def divide_and_conquer_optimize(
+    numbers: Sequence[int],
+    positions: Positions,
+    charge: float = ...,
+    multiplicity: int = ...,
+    reference: str = ...,
+    method: str = ...,
+    core_radius: float = ...,
+    buffer_radius: float = ...,
+    smearing_ev: float = ...,
+    long_range_cutoff: float | None = ...,
+    field: Sequence[float] | None = ...,
+    max_steps: int = ...,
+    force_tol: float = ...,
+) -> dict[str, Any]: ...
 def divide_and_conquer_forces(
     numbers: Sequence[int],
     positions: Positions,
@@ -175,6 +204,7 @@ def born_charges(
     reference: str = ...,
     method: str = ...,
     enforce: bool = ...,
+    cphf_max_iter: int | None = ...,
 ) -> dict[str, Any]: ...
 def dielectric(
     numbers: Sequence[int],
@@ -186,6 +216,7 @@ def dielectric(
     reference: str = ...,
     method: str = ...,
     include_ionic: bool = ...,
+    cphf_max_iter: int | None = ...,
 ) -> dict[str, Any]: ...
 def berry_polarization(
     numbers: Sequence[int],
@@ -236,6 +267,7 @@ def ir_spectrum(
     reference: str = ...,
     method: str = ...,
     field: Sequence[float] | None = ...,
+    cphf_max_iter: int | None = ...,
 ) -> dict[str, Any]: ...
 def molden(
     numbers: Sequence[int],
@@ -245,6 +277,7 @@ def molden(
     reference: str = ...,
     method: str = ...,
     field: Sequence[float] | None = ...,
+    basis: str = ...,
 ) -> str: ...
 def dipole(
     numbers: Sequence[int],

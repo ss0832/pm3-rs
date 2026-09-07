@@ -99,7 +99,7 @@ pub fn frac_phase(frac: [f64; 3], t: [i32; 3]) -> faer::c64 {
 /// `k + q`, folded back into `[-0.5, 0.5)`, keeping `k`'s weight.
 ///
 /// Folding costs nothing here, and that is worth saying because it is not true of every method.
-/// [`crate::pbc::kscf::bloch_fock`] assembles `F(k) = Σ_T e^{ik·T} F(T)` in the periodic-gauge AO
+/// `pbc::kscf::bloch_fock` assembles `F(k) = Σ_T e^{ik·T} F(T)` in the periodic-gauge AO
 /// basis, with no `e^{iG·r}` factors anywhere, so `F(k + G) ≡ F(k)` element for element and the
 /// eigenvectors are literally the same. A plane-wave code has to track the umklapp; this does
 /// not.

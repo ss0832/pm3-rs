@@ -13,11 +13,13 @@ gradient = native.gradient
 forces = native.forces
 optimize = native.optimize
 frequencies = native.frequencies
+orbitals = native.orbitals
 hessian = native.hessian
 periodic_single_point = native.periodic_single_point
 periodic_forces = native.periodic_forces
 phonons = native.phonons
 divide_and_conquer = native.divide_and_conquer
+divide_and_conquer_optimize = native.divide_and_conquer_optimize
 divide_and_conquer_forces = native.divide_and_conquer_forces
 born_charges = native.born_charges
 dielectric = native.dielectric
@@ -38,11 +40,13 @@ __all__ = [
     "forces",
     "optimize",
     "frequencies",
+    "orbitals",
     "hessian",
     "periodic_single_point",
     "periodic_forces",
     "phonons",
     "divide_and_conquer",
+    "divide_and_conquer_optimize",
     "divide_and_conquer_forces",
     "born_charges",
     "dielectric",
@@ -56,4 +60,21 @@ __all__ = [
     "dipole",
     "dynamical_matrix",
 ]
-__version__ = "0.2.3"
+
+def _installed_version() -> str:
+    """The version of the installed distribution, rather than a literal that can drift.
+
+    This used to be a hard-coded string, and by 0.2.5 it still said ``0.2.3``: it had
+    survived two releases without anyone noticing, because nothing reads it on the way to
+    an answer. Asking the package metadata means it cannot be wrong; the fallback covers
+    running straight from the source tree with nothing installed.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("pm3-rs-python")
+    except PackageNotFoundError:
+        return "0+unknown"
+
+
+__version__ = _installed_version()

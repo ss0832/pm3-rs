@@ -7,7 +7,7 @@
 //! pairs where at least one atom carries d orbitals (MNDO-d / PM3).
 //!
 //! Each local-frame integral `(ij|kl)` is evaluated directly with the
-//! Dewar–Sabelli–Ohno point-charge multipole kernel [`charg`] via [`rijkl`]
+//! Dewar–Sabelli–Ohno point-charge multipole kernel `charg` via `rijkl`
 //! (MOPAC `mndod.F90`), then all AO indices are rotated from the diatomic
 //! local frame to the molecular frame with the p/d rotation
 //! ([`crate::rotations`]). This bypasses MOPAC's `ind2`/`isym`/`rep(491)`

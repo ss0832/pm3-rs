@@ -24,7 +24,7 @@ const SPD_M: [i8; 9] = [0, 0, 1, -1, 0, 1, -1, 2, -2];
 
 /// Diatomic overlap block `S[μ_i][ν_j]` (9×9, global frame) for a pair where at
 /// least one atom carries d orbitals. Local σ/π/δ Slater overlaps are evaluated
-/// by numerical quadrature ([`overlap_sto`]) and rotated to the molecular frame
+/// by numerical quadrature (`overlap_sto`) and rotated to the molecular frame
 /// with the p/d rotation ([`Rotation`]). Generic over the scalar type so the
 /// analytic gradient/Hessian differentiate through it.
 pub fn diatom_overlap_spd<S: Scalar>(

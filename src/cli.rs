@@ -12,7 +12,80 @@ use crate::{
     Molecule, OptOptions, Pm3Options, Pm3Parameters,
 };
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Which Cartesian directions are periodic.
+///
+/// A cell is periodic per direction — `Cell::pbc` is a `[bool; 3]`, not a dimensionality — so a
+/// chain, a slab and a crystal are all expressible, and which axes carry the lattice is the
+/// caller's to say. The spellings below all mean the same thing because a reader writing "x and
+/// z" should not have to remember whether this flag wants `1,0,1` or `101` or `xz`:
+///
+/// ```text
+/// --pbc 1,0,1      --pbc 101      --pbc xz      --pbc x,z      --pbc true,false,true
+/// ```
+///
+/// An empty selection (`--pbc 0,0,0` or `--pbc none`) is an isolated cell, which is legal — it is
+/// the zero-dimensional case of the same machinery — but almost always a mistake to write with a
+/// `--cell` beside it, so it is accepted and the commands that need a lattice refuse it by name
+/// rather than silently producing a molecular answer.
+fn parse_pbc(value: &str) -> Result<[bool; 3], String> {
+    let text = value.trim().to_ascii_lowercase();
+    if text == "none" {
+        return Ok([false; 3]);
+    }
+    if text == "all" || text == "xyz" {
+        return Ok([true; 3]);
+    }
+
+    // Axis letters, with or without separators: `xz`, `x,z`, `x z`.
+    let letters: Vec<char> = text
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != ',')
+        .collect();
+    if !letters.is_empty() && letters.iter().all(|c| matches!(c, 'x' | 'y' | 'z')) {
+        let mut flags = [false; 3];
+        for c in &letters {
+            flags[match c {
+                'x' => 0,
+                'y' => 1,
+                _ => 2,
+            }] = true;
+        }
+        return Ok(flags);
+    }
+
+    // Words, or numbers with or without separators: `true,false,true`, `1,0,1`, `101`.
+    let fields: Vec<String> = if text.contains(',') || text.contains(char::is_whitespace) {
+        text.split([',', ' ', '\t'])
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    } else {
+        text.chars().map(|c| c.to_string()).collect()
+    };
+    if fields.len() != 3 {
+        return Err(format!(
+            "--pbc takes three directions, got {} from `{value}`. Write it as `1,0,1`, `101`, \
+             `xz`, or `true,false,true` — all four mean periodic along x and z",
+            fields.len()
+        ));
+    }
+    let mut flags = [false; 3];
+    for (axis, field) in fields.iter().enumerate() {
+        flags[axis] = match field.as_str() {
+            "1" | "t" | "true" | "yes" | "on" => true,
+            "0" | "f" | "false" | "no" | "off" => false,
+            other => {
+                return Err(format!(
+                    "--pbc: `{other}` is not a direction flag. Use 1/0, true/false, or the axis \
+                     letters (`--pbc xz`)"
+                ))
+            }
+        };
+    }
+    Ok(flags)
+}
 
 fn cli_usage() -> &'static str {
     r#"Usage: pm3_rs_cli <command> file.xyz [options]
@@ -26,6 +99,8 @@ Commands
   optimize     optimize geometry and write <input>.pm3opt.xyz
   frequencies  harmonic frequencies (cm^-1)
   hessian      Cartesian Hessian (eV/Bohr^2)
+  orbitals     molecular orbital energies and occupations, with HOMO and LUMO
+               marked; --coefficients adds the coefficient matrix
   molden       write <input>.molden: orbitals, energies and occupations for a viewer
   ir           harmonic frequencies with infrared intensities (km/mol)
   stress       stress tensor (eV/Bohr^3); needs --cell
@@ -45,17 +120,36 @@ Options
   --reference <name>      auto | rhf | uhf; auto is RHF closed shell, UHF open.
                           uhf on a singlet is how a broken-symmetry solution is
                           asked for; rhf on an open shell is refused
-  --method <name>         pm3 | pm3-d3 | pm3-d3h4 | pm3-d3h4x
+  --method <name>         pm3 | pm3-d3 | pm3-d3h4 | pm3-d3h4x, each optionally +mmok
   --no-diis               disable SCF acceleration
   --cell <a[,b,c[,...]]>  cell in Angstrom: one number (cubic), three
                           (orthorhombic), or nine (lattice vectors as rows)
-  --pbc <x,y,z>           which directions are periodic (1 or 0); default 1,1,1
+  --pbc <axes>            which directions are periodic; default all three.
+                          `1,0,1`, `101`, `xz`, `x,z` and `true,false,true` all
+                          mean the same thing. `none` is an isolated cell
   --kpts <n1,n2,n3>       Gamma-centred Monkhorst-Pack mesh; default is Gamma only
   --q <h,k,l>             phonon wavevector, in fractions of the reciprocal
                           lattice vectors; makes `phonons` a DFPT run at that
                           wavevector instead of the Gamma-point Hessian. With
                           --kpts the response is summed over that mesh, each
                           point paired with k+q
+  --coefficients          with `orbitals`, print the MO coefficient matrix as
+                          well as the energies, labelled by atom and orbital
+  --sto                   with `molden`, write [STO] rather than [GTO]: the
+                          Slater exponents PM3 actually uses, instead of the
+                          even-tempered Gaussian fit to them. [GTO] is the
+                          default because it is what viewers read
+  --output <path>         with `molden`, where to write the file; the default is
+                          <input stem>.molden beside the input
+  --relax-cell            with `optimize` on a periodic cell, relax the lattice
+                          vectors as well as the atoms. Default is atoms only;
+                          --fixed-cell says so explicitly. A slab relaxes its two
+                          in-plane vectors and leaves the vacuum alone
+  --fixed-cell            the default, stated
+  --max-steps <n>         optimizer iteration cap
+  --force-tol <f>         convergence on the largest force, eV/Angstrom
+  --stress-tol <s>        convergence on the largest stress, eV/Angstrom^3
+  --pressure <p>          external pressure in eV/Angstrom^3; minimizes E + PV
   --rigid-ion             with --q, leave the electronic response out: the
                           fixed-density half of D(q) alone
   --supercell <n1,n2,n3>  replication for `phonon-bands`: the force constants
@@ -94,6 +188,8 @@ struct Cli {
     /// a broken-symmetry UHF singlet could not be asked for from here at all.
     reference: crate::Reference,
     variant: crate::Variant,
+    /// MOPAC's MMOK amide correction, from a +mmok suffix on --method. Off by default.
+    mmok: bool,
     /// Whatever the caller wrote after `--cell`: one number (cubic), three (orthorhombic edges)
     /// or nine (lattice vectors as rows), all in Angstrom.
     cell: Option<Vec<f64>>,
@@ -106,6 +202,28 @@ struct Cli {
     q: Option<[f64; 3]>,
     /// With `q`, drop the electronic response and report the rigid-ion matrix.
     rigid_ion: bool,
+    /// Print the MO coefficient matrix as well as the energies (`orbitals` only).
+    coefficients: bool,
+    /// Write `[STO]` rather than `[GTO]` in the Molden file (`molden` only).
+    ///
+    /// PM3 *is* a Slater basis, so `[STO]` is the honest transcription and `[GTO]` is a fitted
+    /// approximation to it. `[GTO]` is nevertheless the default because it is what viewers
+    /// actually read; this flag is for the ones that take `[STO]`, and for anyone who wants the
+    /// exponents the model really uses rather than a 14-primitive fit to them.
+    sto: bool,
+    /// Where the Molden file goes; `None` puts it beside the input as `<stem>.molden`.
+    output: Option<String>,
+    /// `optimize` on a periodic cell: whether the lattice vectors move too.
+    ///
+    /// `None` means the caller did not say, and the default is atoms-only — which is what this
+    /// path has always done, and is kept so that a command that worked keeps meaning the same
+    /// thing. Whichever applies is printed, because "optimized" without saying what moved is the
+    /// kind of output someone reads once and misremembers.
+    relax_cell: Option<bool>,
+    max_steps: Option<usize>,
+    force_tol: Option<f64>,
+    stress_tol: Option<f64>,
+    pressure: Option<f64>,
     /// Supercell replication for `phonon-bands`; `None` means the command was not asked for.
     supercell: Option<[usize; 3]>,
     /// Cartesian direction for the LO–TO non-analytic term; `None` leaves it off.
@@ -175,6 +293,7 @@ fn parse_args(argv: &[String]) -> Result<Cli, String> {
     let mut use_diis = true;
     let mut reference = crate::Reference::Auto;
     let mut variant = crate::Variant::Pm3;
+    let mut mmok = false;
     let mut cell = None;
     let mut pbc = None;
     let mut kpts = None;
@@ -183,6 +302,16 @@ fn parse_args(argv: &[String]) -> Result<Cli, String> {
     let mut field = None;
     let mut q = None;
     let mut rigid_ion = false;
+    let mut coefficients = false;
+    let mut sto = false;
+    let mut output: Option<String> = None;
+    // `--dc-core` has a default, so its value cannot say whether the caller set it.
+    let mut cli_saw_dc_core = false;
+    let mut relax_cell: Option<bool> = None;
+    let mut max_steps: Option<usize> = None;
+    let mut force_tol: Option<f64> = None;
+    let mut stress_tol: Option<f64> = None;
+    let mut pressure: Option<f64> = None;
     let mut supercell = None;
     let mut static_dielectric = false;
     let mut lo_to = None;
@@ -196,8 +325,24 @@ fn parse_args(argv: &[String]) -> Result<Cli, String> {
             rigid_ion = true;
             continue;
         }
+        if flag == "--coefficients" {
+            coefficients = true;
+            continue;
+        }
+        if flag == "--relax-cell" {
+            relax_cell = Some(true);
+            continue;
+        }
+        if flag == "--fixed-cell" {
+            relax_cell = Some(false);
+            continue;
+        }
         if flag == "--static" {
             static_dielectric = true;
+            continue;
+        }
+        if flag == "--sto" {
+            sto = true;
             continue;
         }
         let value = args
@@ -226,8 +371,23 @@ fn parse_args(argv: &[String]) -> Result<Cli, String> {
                 };
             }
             "--method" => {
-                variant = crate::Variant::parse(&value).ok_or_else(|| {
-                    format!("unknown method: {value} (PM3, PM3-D3, PM3-D3H4, PM3-D3H4X)")
+                // A `+mmok` suffix switches on MOPAC's molecular-mechanics amide correction,
+                // the same spelling the Python `method=` string takes. It is off by default
+                // here and on by default in MOPAC, which is the difference `--method
+                // pm3+mmok` exists to close when reproducing a MOPAC run.
+                let lower = value.to_ascii_lowercase().replace([' ', '_'], "-");
+                let base = match lower.strip_suffix("+mmok") {
+                    Some(rest) => {
+                        mmok = true;
+                        rest.to_owned()
+                    }
+                    None => lower,
+                };
+                variant = crate::Variant::parse(&base).ok_or_else(|| {
+                    format!(
+                        "unknown method: {value} (PM3, PM3-D3, PM3-D3H4, PM3-D3H4X, each \
+                         optionally with a +MMOK suffix)"
+                    )
                 })?;
             }
             "--field" => {
@@ -245,13 +405,7 @@ fn parse_args(argv: &[String]) -> Result<Cli, String> {
                 ));
             }
             "--cell" => cell = Some(parse_numbers(&value, "--cell")?),
-            "--pbc" => {
-                let flags = parse_numbers(&value, "--pbc")?;
-                if flags.len() != 3 {
-                    return Err("--pbc takes three values (1 = periodic, 0 = not)".to_owned());
-                }
-                pbc = Some([flags[0] != 0.0, flags[1] != 0.0, flags[2] != 0.0]);
-            }
+            "--pbc" => pbc = Some(parse_pbc(&value)?),
             "--kpts" => {
                 // Parsed as integers, not as floats cast to `usize`. The cast saturated a
                 // negative to zero, so `--kpts -1,1,1` produced "k-point division along axis 0
@@ -304,6 +458,12 @@ fn parse_args(argv: &[String]) -> Result<Cli, String> {
                     .parse()
                     .map_err(|_| format!("invalid --strings: {value} (a whole number)"))?;
             }
+            "--output" => {
+                if value.is_empty() {
+                    return Err("--output needs a path".to_owned());
+                }
+                output = Some(value.clone());
+            }
             "--q" => {
                 let components = parse_numbers(&value, "--q")?;
                 if components.len() != 3 {
@@ -321,7 +481,36 @@ fn parse_args(argv: &[String]) -> Result<Cli, String> {
                         .map_err(|_| format!("invalid divide-and-conquer buffer: {value}"))?,
                 )
             }
+            "--max-steps" => {
+                max_steps = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("invalid --max-steps: {value} (a whole number)"))?,
+                )
+            }
+            "--force-tol" => {
+                force_tol = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("invalid --force-tol: {value} (eV/Angstrom)"))?,
+                )
+            }
+            "--stress-tol" => {
+                stress_tol = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("invalid --stress-tol: {value} (eV/Angstrom^3)"))?,
+                )
+            }
+            "--pressure" => {
+                pressure = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("invalid --pressure: {value} (eV/Angstrom^3)"))?,
+                )
+            }
             "--dc-core" => {
+                cli_saw_dc_core = true;
                 dc_core = value
                     .parse()
                     .map_err(|_| format!("invalid divide-and-conquer core radius: {value}"))?
@@ -331,9 +520,31 @@ fn parse_args(argv: &[String]) -> Result<Cli, String> {
     }
     match command.as_str() {
         "energy" | "gradient" | "charges" | "optimize" | "frequencies" | "hessian" | "stress"
-        | "phonons" | "bands" | "molden" | "ir" | "phonon-bands" | "born" | "dielectric"
-        | "berry" | "finite-field" => {}
+        | "phonons" | "bands" | "molden" | "ir" | "orbitals" | "phonon-bands" | "born"
+        | "dielectric" | "berry" | "finite-field" => {}
         _ => return Err(format!("unknown command: {command}\n\n{}", cli_usage())),
+    }
+    // `--dc` covers the energy, the charges and the geometry — the paths a partitioned density
+    // actually has. It used to be accepted with *every* command and then answered a single point
+    // regardless: `optimize big.xyz --dc 4.8` printed an energy, wrote no `.pm3opt.xyz`,
+    // optimized nothing, and exited 0. That is the failure mode the rest of this parser exists to
+    // prevent — a flag that silently replaces the command — so the ones it cannot serve are
+    // refused by name, and `optimize` is no longer one of them.
+    if dc_buffer.is_some() && !matches!(command.as_str(), "energy" | "charges" | "optimize") {
+        return Err(format!(
+            "--dc has no partitioned {command}: the second derivatives a Hessian, frequencies or \
+             an infrared spectrum need are not defined by the current partitioning, and the \
+             wavefunction a Molden file draws is assembled per subsystem rather than globally. \
+             It would print an energy and silently do none of what {command} was asked for. Drop \
+             --dc, or use `energy`, `charges` or `optimize`"
+        ));
+    }
+    if dc_buffer.is_none() && cli_saw_dc_core {
+        return Err(
+            "--dc-core sets the core radius of a divide-and-conquer partition, and there is no \
+             partition without --dc"
+                .to_owned(),
+        );
     }
     if cell.is_none()
         && matches!(
@@ -411,6 +622,21 @@ fn parse_args(argv: &[String]) -> Result<Cli, String> {
         return Err(format!(
             "--static asks for the ionic half of a dielectric tensor and only `dielectric` \
              reports one; {command} would ignore it"
+        ));
+    }
+    // `--sto` and `--output` both name something only the Molden writer has: a basis-set section
+    // to choose the form of, and a single file to put somewhere. Every other command prints to
+    // stdout, so `--output` on one would look honoured and write nothing.
+    if sto && command != "molden" {
+        return Err(format!(
+            "--sto chooses the basis-set section of a Molden file and only `molden` writes one; \
+             {command} would ignore it"
+        ));
+    }
+    if output.is_some() && command != "molden" {
+        return Err(format!(
+            "--output names where a Molden file goes and only `molden` writes a file to name; \
+             {command} prints to stdout, so redirect it with `>` instead"
         ));
     }
     if cell.is_none() && (pbc.is_some() || kpts.is_some()) {
@@ -493,11 +719,20 @@ fn parse_args(argv: &[String]) -> Result<Cli, String> {
         use_diis,
         reference,
         variant,
+        mmok,
         cell,
         pbc,
         kpts,
         q,
         rigid_ion,
+        coefficients,
+        sto,
+        output,
+        relax_cell,
+        max_steps,
+        force_tol,
+        stress_tol,
+        pressure,
         supercell,
         lo_to,
         strings,
@@ -508,11 +743,33 @@ fn parse_args(argv: &[String]) -> Result<Cli, String> {
     })
 }
 
+/// Write an XYZ, carrying the cell in the comment line when there is one.
+///
+/// The `Lattice="..."` key is the extended-XYZ convention: nine numbers, the three lattice
+/// vectors as rows, in Ångström, which is the same order `--cell` accepts. Without it a relaxed
+/// periodic structure came back as a bare list of atoms and the cell it was relaxed *in* was
+/// gone — harmless while the CLI could only hold the cell fixed, and silent data loss the moment
+/// `--relax-cell` exists, since the whole answer is then in the vectors that were dropped.
 fn write_xyz(path: &Path, molecule: &Molecule) -> std::io::Result<()> {
-    let mut out = format!(
-        "{}\npm3-rs optimized geometry; coordinates in Angstrom\n",
-        molecule.len()
-    );
+    let comment = match molecule.cell {
+        Some(cell) => {
+            let rows = cell.to_rows();
+            let numbers: Vec<String> = rows
+                .iter()
+                .flat_map(|row| row.iter())
+                .map(|v| format!("{:.10}", v / ANGSTROM_TO_BOHR))
+                .collect();
+            format!(
+                "Lattice=\"{}\" pbc=\"{} {} {}\" pm3-rs optimized geometry; Angstrom",
+                numbers.join(" "),
+                if cell.pbc[0] { "T" } else { "F" },
+                if cell.pbc[1] { "T" } else { "F" },
+                if cell.pbc[2] { "T" } else { "F" },
+            )
+        }
+        None => "pm3-rs optimized geometry; coordinates in Angstrom".to_string(),
+    };
+    let mut out = format!("{}\n{comment}\n", molecule.len());
     for atom in &molecule.atoms {
         let symbol = crate::z_to_symbol(atom.z).unwrap_or("X");
         let pos = atom.position / ANGSTROM_TO_BOHR;
@@ -543,6 +800,54 @@ fn run_extended(
             buffer_radius: buffer * ANGSTROM_TO_BOHR,
             ..crate::DcOptions::default()
         };
+        // The command is looked at *before* the single point runs. It used to be looked at after,
+        // which is how `optimize --dc` came to print an energy and do nothing else.
+        if cli.command == "optimize" {
+            if molecule.cell.is_some() {
+                return Err(
+                    "a partitioned geometry optimization is molecular so far: the periodic \
+                     partitioned gradient exists but is not wired to the optimizer. Drop --cell, \
+                     or drop --dc"
+                        .into(),
+                );
+            }
+            let defaults = crate::OptOptions::default();
+            let opt = crate::OptOptions {
+                max_iter: cli.max_steps.unwrap_or(defaults.max_iter),
+                gtol: cli
+                    .force_tol
+                    .map(crate::constants::force_tol_to_au)
+                    .unwrap_or(defaults.gtol),
+                ..defaults
+            };
+            let result = crate::optimizer::optimize_dc(molecule, params, options, &dc, &opt)?;
+            let input = Path::new(&cli.path);
+            let stem = input
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("optimized");
+            let output = input.with_file_name(format!("{stem}.pm3opt.xyz"));
+            write_xyz(&output, &result.molecule)?;
+            println!(
+                "Converged: {} after {} optimization steps (divide and conquer)",
+                result.converged, result.iterations
+            );
+            println!("Final energy: {:.12} eV", result.scf.total_ev);
+            println!(
+                "Heat of formation: {:.8} kcal/mol",
+                result.scf.heat_of_formation_kcal
+            );
+            println!("Subsystems: {}", result.scf.n_subsystems);
+            // The buffer is the knob that matters and the gradient inherits its truncation
+            // rather than its square, so the number to widen is named beside the answer.
+            println!(
+                "Buffer radius: {:.3} Angstrom -- widen it and re-run before believing this \
+                 geometry",
+                buffer
+            );
+            println!("Optimized geometry: {}", output.display());
+            return Ok(());
+        }
         if molecule.cell.is_some() {
             let r = crate::run_dc_gamma(molecule, params, options, &periodic, &dc)?;
             println!("Total energy per cell: {:.12} eV", r.total_ev);
@@ -924,21 +1229,81 @@ fn run_extended(
             );
         }
         "optimize" => {
-            let result = crate::relax(
-                molecule,
-                params,
-                options,
-                &periodic,
-                &crate::PeriodicOptOptions::default(),
-            )?;
+            let defaults = crate::PeriodicOptOptions::default();
+            // Atoms only unless asked, which is what this path has always done. Changing the
+            // default would change the answer of a command that already worked.
+            let variable = cli.relax_cell.unwrap_or(false);
+            let opt = crate::PeriodicOptOptions {
+                max_iter: cli.max_steps.unwrap_or(defaults.max_iter),
+                // eV/Angstrom in, eV/Bohr inside -- see the helpers, which exist because
+                // writing these three lines by hand has gone wrong every time it was tried.
+                gtol: cli
+                    .force_tol
+                    .map(crate::constants::force_tol_to_au)
+                    .unwrap_or(defaults.gtol),
+                stress_tol: cli
+                    .stress_tol
+                    .map(crate::constants::stress_tol_to_au)
+                    .unwrap_or(defaults.stress_tol),
+                pressure: cli
+                    .pressure
+                    .map(crate::constants::stress_tol_to_au)
+                    .unwrap_or(defaults.pressure),
+                cell: if variable {
+                    crate::CellRelaxation::Variable
+                } else {
+                    crate::CellRelaxation::Fixed
+                },
+                ..defaults
+            };
+            let result = crate::relax(molecule, params, options, &periodic, &opt)?;
             let out = Path::new(&cli.path).with_extension("pm3opt.xyz");
             write_xyz(&out, &result.molecule)?;
+            println!(
+                "Relaxed:               {}",
+                if variable {
+                    "atoms and lattice vectors (--relax-cell)"
+                } else {
+                    "atoms only; the cell was held fixed (--relax-cell to relax it)"
+                }
+            );
             println!("Converged:             {}", result.converged);
             println!("Iterations:            {}", result.iterations);
             println!(
                 "Total energy per cell: {:.12} eV",
                 result.gradient.energy_ev
             );
+            println!(
+                "Heat of formation:     {:.8} kcal/mol",
+                result.gradient.scf.heat_of_formation_kcal
+            );
+            println!(
+                "Largest force:         {:.8} eV/Angstrom",
+                result.gradient.max_gradient / ANGSTROM_TO_BOHR
+            );
+            if let Some(stress) = result.gradient.stress {
+                let worst = stress
+                    .col
+                    .iter()
+                    .flat_map(|c| c.to_array())
+                    .map(f64::abs)
+                    .fold(0.0_f64, f64::max);
+                println!(
+                    "Largest stress:        {:.8} eV/Angstrom^3",
+                    worst / ANGSTROM_TO_BOHR.powi(3)
+                );
+            }
+            if let Some(cell) = result.molecule.cell {
+                println!("Relaxed cell (Angstrom, lattice vectors as rows):");
+                for row in cell.to_rows() {
+                    println!(
+                        "  {:>14.8} {:>14.8} {:>14.8}",
+                        row[0] / ANGSTROM_TO_BOHR,
+                        row[1] / ANGSTROM_TO_BOHR,
+                        row[2] / ANGSTROM_TO_BOHR
+                    );
+                }
+            }
             println!("Wrote {}", out.display());
         }
         "hessian" => {
@@ -970,6 +1335,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         use_diis: cli.use_diis,
         reference: cli.reference,
         variant: cli.variant,
+        mmok: cli.mmok,
         // `finite-field` is the one command whose `--field` is *not* an `-𝓔·r` term in the
         // Hamiltonian: it is the field the Berry-phase enthalpy is minimized against, and it is
         // handed to `run_finite_field` separately. Putting it here as well would be the same
@@ -1057,16 +1423,135 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             );
             println!("Optimized geometry: {}", output.display());
         }
+        "orbitals" => {
+            let result = run_pm3(&molecule, &params, &options)?;
+            let basis = crate::basis::Basis::build(&molecule, &params)?;
+            let restricted = result.mo_coeff_beta.is_none();
+
+            // AO row labels, so a coefficient is readable without reconstructing the basis
+            // ordering from the element table.
+            let labels: Vec<String> = basis
+                .aos
+                .iter()
+                .map(|ao| {
+                    let symbol = crate::system::z_to_symbol(ao.z).unwrap_or("X");
+                    let name = match ao.orb {
+                        0 => "s",
+                        1 => "px",
+                        2 => "py",
+                        3 => "pz",
+                        4 => "dx2-y2",
+                        5 => "dxz",
+                        6 => "dz2",
+                        7 => "dyz",
+                        _ => "dxy",
+                    };
+                    format!("{}{} {}", symbol, ao.atom + 1, name)
+                })
+                .collect();
+
+            let print_set = |spin: &str,
+                             energies: &[f64],
+                             coeff: &crate::linalg::Matrix,
+                             n_occ: usize,
+                             occupancy: f64| {
+                println!();
+                println!("{spin} orbitals ({} occupied of {})", n_occ, energies.len());
+                println!(
+                    "{:>5} {:>8} {:>16} {:>16}   ",
+                    "index", "occ", "energy (eV)", "energy (Hartree)"
+                );
+                for (index, energy) in energies.iter().enumerate() {
+                    let occupation = if index < n_occ { occupancy } else { 0.0 };
+                    // The frontier is what a reader is looking for, so it is marked rather
+                    // than left to be counted off against the occupation column.
+                    let mark = if index + 1 == n_occ {
+                        "  <- HOMO"
+                    } else if index == n_occ {
+                        "  <- LUMO"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "{:>5} {occupation:>8.4} {energy:>16.8} {:>16.10}{mark}",
+                        index + 1,
+                        energy * crate::constants::EV_TO_HARTREE
+                    );
+                }
+                if cli.coefficients {
+                    println!();
+                    println!("{spin} coefficients (rows = atomic orbitals, columns = MOs)");
+                    print!("{:>12}", "");
+                    for mo in 0..coeff.cols {
+                        print!(" {:>11}", format!("MO {}", mo + 1));
+                    }
+                    println!();
+                    for (row, label) in labels.iter().enumerate() {
+                        print!("{label:>12}");
+                        for mo in 0..coeff.cols {
+                            print!(" {:>11.6}", coeff[(row, mo)]);
+                        }
+                        println!();
+                    }
+                }
+            };
+
+            print_set(
+                if restricted { "Restricted" } else { "Alpha" },
+                &result.mo_energies,
+                &result.mo_coeff,
+                result.n_occ,
+                if restricted { 2.0 } else { 1.0 },
+            );
+            if let (Some(coeff), Some(energies)) = (&result.mo_coeff_beta, &result.mo_energies_beta)
+            {
+                print_set("Beta", energies, coeff, result.n_beta, 1.0);
+            }
+
+            println!();
+            // Across both spin channels: a radical's beta LUMO sits below its alpha one, so the
+            // alpha spectrum alone names the wrong frontier.
+            match (result.homo_ev, result.lumo_ev) {
+                (Some(homo), Some(lumo)) => {
+                    println!("HOMO:  {homo:.8} eV");
+                    println!("LUMO:  {lumo:.8} eV");
+                    println!("Gap:   {:.8} eV", lumo - homo);
+                }
+                _ => println!("No frontier orbital: the valence shell is empty or full."),
+            }
+        }
         "molden" => {
             let result = run_pm3(&molecule, &params, &options)?;
-            let text = crate::molden::molden_string(&molecule, &params, &result)?;
-            let input = Path::new(&cli.path);
-            let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("pm3");
-            let output = input.with_file_name(format!("{stem}.molden"));
+            let form = if cli.sto {
+                crate::molden::MoldenBasis::Sto
+            } else {
+                crate::molden::MoldenBasis::Gto
+            };
+            let text = crate::molden::molden_string_with(&molecule, &params, &result, form)?;
+            let output = match &cli.output {
+                Some(path) => PathBuf::from(path),
+                None => {
+                    let input = Path::new(&cli.path);
+                    let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("pm3");
+                    input.with_file_name(format!("{stem}.molden"))
+                }
+            };
             std::fs::write(&output, text)?;
             println!("Wrote {}", output.display());
             println!("SCF iterations:        {}", result.iterations);
             println!("Orbitals:              {}", result.mo_energies.len());
+            // Which basis section was written, because the two are not interchangeable and a
+            // viewer that silently ignores the one it cannot read shows an empty orbital.
+            match form {
+                crate::molden::MoldenBasis::Gto => println!(
+                    "Basis section:         [GTO] (even-tempered fit to the Slater functions; \
+                     what viewers read)"
+                ),
+                crate::molden::MoldenBasis::Sto => println!(
+                    "Basis section:         [STO] (the Slater exponents PM3 actually uses; \
+                     fewer viewers read this)"
+                ),
+            }
             if result.unrestricted {
                 println!("Spin sets:             2 (alpha and beta)");
             } else {
@@ -1183,6 +1668,340 @@ mod tests {
             .chain(pieces.iter().copied())
             .map(str::to_owned)
             .collect()
+    }
+
+    /// Every command the parser accepts. Kept here rather than derived, so that adding a command
+    /// without adding it to the matrix below is a compile-time-visible omission in one place.
+    const COMMANDS: &[&str] = &[
+        "energy",
+        "gradient",
+        "charges",
+        "optimize",
+        "frequencies",
+        "hessian",
+        "orbitals",
+        "molden",
+        "ir",
+        "stress",
+        "phonons",
+        "bands",
+        "phonon-bands",
+        "born",
+        "dielectric",
+        "berry",
+        "finite-field",
+    ];
+
+    /// Flag groups, crossed against every command.
+    ///
+    /// Each entry is one option as a caller would type it. The point is not that every pairing is
+    /// meaningful — most are not — but that every pairing produces either a run or a sentence,
+    /// and never a panic or a silent drop.
+    const FLAG_SETS: &[&[&str]] = &[
+        &[],
+        &["--charge", "1"],
+        &["--charge", "-1", "--multiplicity", "2"],
+        &["--multiplicity", "3"],
+        &["--reference", "uhf"],
+        &["--reference", "rhf"],
+        &["--method", "pm3-d3h4x"],
+        &["--no-diis"],
+        &["--field", "0.1,0,0"],
+        &["--cell", "9.0"],
+        &["--cell", "9.0", "--pbc", "xz"],
+        &["--cell", "9.0", "--pbc", "1,0,0"],
+        &["--cell", "9.0", "--kpts", "2,2,2"],
+        &["--cell", "9.0", "--q", "0.25,0,0"],
+        &["--cell", "9.0", "--q", "0,0,0", "--rigid-ion"],
+        &["--cell", "9.0", "--q", "0,0,0", "--lo-to", "1,0,0"],
+        &["--cell", "9.0", "--supercell", "2,1,1"],
+        &["--cell", "9.0", "--static"],
+        &["--cell", "9.0", "--strings", "6"],
+        &["--cell", "9.0", "--field", "0.001,0,0", "--kpts", "3,1,1"],
+        &["--dc", "4.5"],
+        &["--dc", "4.5", "--dc-core", "3.0"],
+        &["--coefficients"],
+        &["--sto"],
+        &["--output", "out.molden"],
+        &["--sto", "--output", "out.molden"],
+        &["--relax-cell"],
+        &["--fixed-cell", "--max-steps", "5"],
+        &["--force-tol", "0.01", "--stress-tol", "1e-4"],
+        &["--pressure", "0.001"],
+        &["--cell", "9.0", "--relax-cell", "--pressure", "0.001"],
+    ];
+
+    /// **Every command against every flag set: a run or a sentence, never a panic.**
+    ///
+    /// The parser is a hand-rolled loop with about a hundred and fifty lines of cross-flag
+    /// validation, and its design rule is that a flag a command would ignore is an error rather
+    /// than a silent drop. That rule was enforced by tests written one combination at a time, so
+    /// it held wherever someone had thought to look — and `--dc` silently replaced *seven*
+    /// commands with a single point because nobody had crossed those two.
+    ///
+    /// This crosses them mechanically. It cannot say whether a rejection is the *right* one, but
+    /// it can say that every pairing was considered: a refusal has to name something the caller
+    /// typed, so a message that mentions neither the command nor a flag is one written without a
+    /// particular combination in mind.
+    ///
+    /// It would **not** have caught the `--dc` bug on its own, and that is worth being clear
+    /// about: `optimize --dc 4.8` parsed cleanly, so this test would have counted it as accepted
+    /// and moved on. Catching that needs the command to actually run and be held to what it
+    /// promised, which is
+    /// [`tests::every_molecular_command_produces_what_it_promises`].
+    #[test]
+    fn every_command_and_flag_combination_parses_or_explains_itself() {
+        let mut accepted = 0usize;
+        let mut refused = 0usize;
+        for command in COMMANDS {
+            for flags in FLAG_SETS {
+                let mut pieces = vec![*command, "m.xyz"];
+                pieces.extend_from_slice(flags);
+                match parse_args(&argv(&pieces)) {
+                    Ok(cli) => {
+                        assert_eq!(&cli.command, command);
+                        accepted += 1;
+                    }
+                    Err(message) => {
+                        assert!(
+                            !message.trim().is_empty(),
+                            "{pieces:?} was refused with an empty message"
+                        );
+                        // A refusal that names nothing the caller typed is a refusal written
+                        // without this combination in mind.
+                        let names_something = message.contains(command)
+                            || flags
+                                .iter()
+                                .any(|f| f.starts_with("--") && message.contains(f))
+                            || message.contains("Usage:");
+                        assert!(
+                            names_something,
+                            "{pieces:?} was refused without naming the command or any flag: \
+                             {message}"
+                        );
+                        refused += 1;
+                    }
+                }
+            }
+        }
+        // A sanity floor on the matrix itself: if a refactor made everything parse, or nothing,
+        // the loop above would still pass and would be testing nothing.
+        assert!(
+            accepted > 100 && refused > 40,
+            "the matrix accepted {accepted} and refused {refused}; one of those is degenerate"
+        );
+    }
+
+    /// **Every molecular command runs, and the ones that promise a file write it.**
+    ///
+    /// This is the layer that catches a command being silently replaced. `optimize --dc 4.8`
+    /// parsed cleanly, printed an energy, wrote no `.pm3opt.xyz` and exited zero, because the
+    /// divide-and-conquer branch returned before the command was ever looked at — and a parse
+    /// test cannot see that, because nothing about the parse was wrong. What sees it is holding
+    /// the command to its output.
+    ///
+    /// Molecular only, and a three-atom molecule: this runs a real SCF per command, and the
+    /// periodic commands cost seconds to minutes each. Their arms have their own tests.
+    #[test]
+    fn every_molecular_command_produces_what_it_promises() {
+        let directory = std::env::temp_dir().join(format!(
+            "pm3_cli_matrix_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        let xyz = directory.join("water.xyz");
+        std::fs::write(
+            &xyz,
+            "3\nwater\nO 0.0 0.0 0.0\nH 0.9584 0.0 0.0\nH -0.24 0.9278 0.0\n",
+        )
+        .expect("the fixture writes");
+        let path = xyz.to_str().expect("a utf-8 path").to_owned();
+
+        // command -> the file it documents itself as writing, if any.
+        let cases: &[(&str, Option<&str>)] = &[
+            ("energy", None),
+            ("gradient", None),
+            ("charges", None),
+            ("orbitals", None),
+            ("frequencies", None),
+            ("hessian", None),
+            ("ir", None),
+            ("optimize", Some("water.pm3opt.xyz")),
+            ("molden", Some("water.molden")),
+        ];
+
+        for (command, artifact) in cases {
+            if let Some(name) = artifact {
+                let _ = std::fs::remove_file(directory.join(name));
+            }
+            let cli = parse_args(&argv(&[command, &path]))
+                .unwrap_or_else(|e| panic!("`{command}` did not parse: {e}"));
+            run(cli).unwrap_or_else(|e| panic!("`{command}` failed to run: {e}"));
+            if let Some(name) = artifact {
+                let written = directory.join(name);
+                assert!(
+                    written.exists(),
+                    "`{command}` documents itself as writing {name} and did not. That is what a \
+                     command silently replaced by another looks like from outside."
+                );
+                let bytes = std::fs::metadata(&written).map(|m| m.len()).unwrap_or(0);
+                assert!(bytes > 0, "`{command}` wrote an empty {name}");
+            }
+        }
+
+        // `--coefficients` is only meaningful for `orbitals`, and has to survive the round trip.
+        let cli = parse_args(&argv(&["orbitals", &path, "--coefficients"])).unwrap();
+        assert!(cli.coefficients);
+        run(cli).expect("orbitals with coefficients runs");
+
+        // `--output` has to put the file where it was told, not beside the input. A flag that is
+        // accepted and then ignored writes the default path and reports success, which is
+        // indistinguishable from working until someone looks for the file they asked for.
+        let elsewhere = directory.join("named-by-hand.molden");
+        let cli = parse_args(&argv(&[
+            "molden",
+            &path,
+            "--output",
+            elsewhere.to_str().expect("a utf-8 path"),
+        ]))
+        .unwrap();
+        run(cli).expect("molden with --output runs");
+        assert!(
+            elsewhere.exists(),
+            "`molden --output` wrote somewhere else: the flag was accepted and ignored"
+        );
+
+        // `--sto` has to change the document, not just the message about it.
+        let gto_path = directory.join("as-gto.molden");
+        let sto_path = directory.join("as-sto.molden");
+        for (flag_set, out) in [
+            (vec!["molden", &path], &gto_path),
+            (vec!["molden", &path, "--sto"], &sto_path),
+        ] {
+            let mut args = flag_set;
+            args.push("--output");
+            let out_str = out.to_str().expect("a utf-8 path").to_owned();
+            args.push(&out_str);
+            let cli = parse_args(&argv(&args)).unwrap();
+            run(cli).expect("molden runs");
+        }
+        let gto = std::fs::read_to_string(&gto_path).expect("the GTO document");
+        let sto = std::fs::read_to_string(&sto_path).expect("the STO document");
+        assert!(
+            gto.contains("[GTO]") && !gto.contains("[STO]"),
+            "default is not [GTO]"
+        );
+        assert!(
+            sto.contains("[STO]") && !sto.contains("[GTO]"),
+            "--sto did not write [STO]"
+        );
+        // The wavefunction is the same either way -- only its basis section differs -- so the
+        // orbital block has to be identical. If it is not, one of the two is describing
+        // coefficients against a basis it did not write, which is the misalignment this
+        // release set out to rule out.
+        let orbitals_of = |text: &str| {
+            text.split("[MO]")
+                .nth(1)
+                .map(str::to_owned)
+                .expect("a [MO] section")
+        };
+        assert_eq!(
+            orbitals_of(&gto),
+            orbitals_of(&sto),
+            "the [MO] blocks differ between the two basis sections; the coefficients belong to \
+             one wavefunction and cannot depend on how the basis was written down"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **Every accepted command reaches an implementation.**
+    ///
+    /// `run` dispatches on a `match` whose fallback is `unreachable!("command was validated
+    /// during parsing")`, and `run_extended`'s is a refusal naming the command. Both are correct
+    /// only while the parser's whitelist and the two match arms agree, and nothing was checking
+    /// that they do — a command added to the whitelist and not to the molecular arm is a panic in
+    /// release, reached by a caller typing a documented command.
+    ///
+    /// So: parse each command, then look it up in the dispatch. Molecular commands run here
+    /// because they are fast; the periodic ones are covered by their own tests, and what is
+    /// asserted for them is that the parser and the periodic dispatch agree about which they are.
+    #[test]
+    fn every_command_reaches_an_implementation() {
+        // The `--dc` branch of `run_extended`, which is checked before the cell is.
+        const PARTITIONED: &[&str] = &["energy", "charges", "optimize"];
+        for command in COMMANDS {
+            let accepted = parse_args(&argv(&[command, "m.xyz", "--dc", "4.5"])).is_ok();
+            assert_eq!(
+                accepted,
+                PARTITIONED.contains(command),
+                "`{command} --dc` parses = {accepted}, but the partitioned dispatch {} handle it",
+                if PARTITIONED.contains(command) {
+                    "does"
+                } else {
+                    "does not"
+                }
+            );
+        }
+
+        // The molecular arm of `run`.
+        const MOLECULAR: &[&str] = &[
+            "energy",
+            "gradient",
+            "charges",
+            "optimize",
+            "molden",
+            "ir",
+            "orbitals",
+            "frequencies",
+            "hessian",
+        ];
+        // The arms of `run_extended`. `charges` shares `energy`'s.
+        const PERIODIC: &[&str] = &[
+            "energy",
+            "charges",
+            "gradient",
+            "stress",
+            "phonons",
+            "frequencies",
+            "bands",
+            "phonon-bands",
+            "born",
+            "dielectric",
+            "berry",
+            "finite-field",
+            "optimize",
+            "hessian",
+        ];
+
+        for command in COMMANDS {
+            let handled = MOLECULAR.contains(command) || PERIODIC.contains(command);
+            assert!(
+                handled,
+                "`{command}` is accepted by the parser and has no arm in either dispatch, so it \
+                 reaches `unreachable!` or a generic refusal"
+            );
+            // And a command that only the periodic dispatch handles must require a cell, or the
+            // molecular arm's `unreachable!` is live.
+            if !MOLECULAR.contains(command) {
+                let error = parse_args(&argv(&[command, "m.xyz"]))
+                    .err()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "`{command}` has no molecular implementation but parses without a \
+                             cell, so `run` would reach its `unreachable!`"
+                        )
+                    });
+                assert!(
+                    error.contains("--cell"),
+                    "`{command}` needs a cell and the message does not say so: {error}"
+                );
+            }
+        }
     }
 
     /// `--q` sends `phonons` through DFPT, and every way of asking for it wrongly is refused

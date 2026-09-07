@@ -4,7 +4,7 @@
 //!
 //! Because NDDO assumes an orthonormal AO basis, the working equations are the plain
 //! eigenproblem `F C = C ε` (no `S`); overlap enters only the resonance term of `H_core`.
-//! The initial density is a **superposition of atomic densities** ([`sad_density`]) — the
+//! The initial density is a **superposition of atomic densities** (`sad_density`) — the
 //! exact free-atom density in a minimal valence basis, far better than the bare-core guess —
 //! and charge convergence is accelerated with the A-DIIS→CDIIS hybrid on the `[F,P]` commutator.
 
@@ -44,6 +44,119 @@ pub enum ScfAccelerator {
     AdiisCdiis,
 }
 
+/// Whether to check that the converged SCF solution is the lowest one in reach.
+///
+/// The SCF equations are nonlinear and have more than one solution. Iteration finds *a*
+/// fixed point, decided by the starting density and the accelerator, and nothing in the
+/// convergence test says it is the ground state: a converged excited solution satisfies
+/// the aufbau principle among its own eigenvalues and reports itself converged.
+///
+/// See [`Pm3Result::scf_improvement_ev`] for how to tell whether the search changed the
+/// answer on a given molecule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ScfStability {
+    /// Keep the first converged solution, whatever it is.
+    Off,
+    /// Search when the converged solution has a frontier gap below
+    /// [`STABILITY_GAP_EV`] — the regime where which orbitals are occupied was genuinely
+    /// in doubt, and the only one where a second solution has ever been found.
+    #[default]
+    Auto,
+    /// Always search, whatever the gap. Costs a handful of extra SCF solves per call.
+    Always,
+}
+
+/// Frontier gap below which [`ScfStability::Auto`] searches for a lower solution.
+///
+/// Measured, not chosen: over the 161-molecule MOPAC oracle every solution that turned out
+/// to be the wrong one had a gap under 4 eV, and every molecule that agreed with MOPAC on
+/// the first attempt had one above 8 eV. The threshold sits in the empty band between.
+pub const STABILITY_GAP_EV: f64 = 6.0;
+
+/// How much lower a rival solution must be before it displaces the incumbent. Well above
+/// the SCF's own convergence noise, so two convergences onto the *same* state never
+/// swap places and the result stays reproducible.
+const STABILITY_TOL_EV: f64 = 1.0e-6;
+
+/// How far apart the two spin densities of an unrestricted state are, as a max element.
+/// `None` when the state is not unrestricted.
+fn spin_purity(state: &ScfState) -> Option<f64> {
+    let spin = state.spin_density.as_ref()?;
+    Some(spin.as_slice().iter().fold(0.0f64, |m, v| m.max(v.abs())))
+}
+
+/// A spin-pure unrestricted state, rewritten as the restricted state it is.
+fn collapse_to_restricted(state: &mut ScfState) {
+    state.spin_density = None;
+    state.mo_energies_beta = None;
+    state.mo_coeff_beta = None;
+    state.n_beta = state.n_occ;
+    state.unrestricted = false;
+}
+
+/// Largest element of `P_α − P_β` still counted as spin-pure. Well above rounding and far
+/// below any real spin polarization.
+const SPIN_PURE_TOL: f64 = 1.0e-8;
+
+/// The HOMO–LUMO gap of a converged state, reading both spins for an open shell.
+///
+/// An open shell's frontier is not the α gap: the highest occupied level may be α and the
+/// lowest virtual β, and taking one spin alone can report a comfortable gap over a state
+/// that has none.
+fn frontier_gap(state: &ScfState) -> f64 {
+    let occupied = |eps: &[f64], n: usize| (n > 0).then(|| eps[n - 1]);
+    let virt = |eps: &[f64], n: usize| (n < eps.len()).then(|| eps[n]);
+    let mut homo = occupied(&state.mo_energies, state.n_occ);
+    let mut lumo = virt(&state.mo_energies, state.n_occ);
+    if let Some(beta) = &state.mo_energies_beta {
+        if let Some(h) = occupied(beta, state.n_beta) {
+            homo = Some(homo.map_or(h, |a: f64| a.max(h)));
+        }
+        if let Some(l) = virt(beta, state.n_beta) {
+            lumo = Some(lumo.map_or(l, |a: f64| a.min(l)));
+        }
+    }
+    match (homo, lumo) {
+        (Some(h), Some(l)) => l - h,
+        // No virtual (or no occupied) orbital at all: nothing to reorder, nothing to search.
+        _ => f64::INFINITY,
+    }
+}
+
+/// Which density the SCF starts from.
+///
+/// A converged SCF is a fixed point, and a Fock operator that depends on its own density
+/// has more than one. Which one the iteration finds is decided by where it starts, so the
+/// guess is part of the answer and not only part of the cost. `Auto` is the default and
+/// picks per reference; the named variants exist so a stability search can deliberately
+/// start somewhere else and compare.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ScfGuess {
+    /// SAD, for both references.
+    ///
+    /// The unrestricted path used to start from core-Hamiltonian orbitals instead, on the
+    /// reasoning that filling one orbital set to two different depths breaks spin symmetry
+    /// without fractionally depleting every atom the way a scaled SAD guess does. The
+    /// 161-molecule oracle says the reasoning did not survive contact: from the core guess
+    /// the O₂ triplet and the amino radical converge to excited solutions (135 and 37
+    /// kcal/mol high) and the methoxy radical needs about 1600 iterations, while from SAD
+    /// all three land on MOPAC's answer in a few dozen.
+    #[default]
+    Auto,
+    /// Superposition of Atomic Densities: each atom's spherically-averaged neutral valence
+    /// configuration, which in a minimal valence basis is the exact free-atom density.
+    Sad,
+    /// Eigenvectors of the bare core Hamiltonian, filled by aufbau. Ignores electron
+    /// repulsion entirely, so it starts from a very different (over-delocalized) density
+    /// than SAD and reaches a different basin on molecules where the two exist.
+    Core,
+    /// SAD with the occupied/virtual balance on the most polarizable atom perturbed, to
+    /// break a spatial symmetry the other two guesses preserve. The perturbation is
+    /// deterministic; it decays to nothing as the SCF converges, so the fixed point it
+    /// reaches is a fixed point of the true Fock.
+    SymmetryBroken,
+}
+
 #[derive(Clone, Debug)]
 pub struct Pm3Options {
     pub charge: f64,
@@ -60,8 +173,24 @@ pub struct Pm3Options {
     /// shells and UHF for open shells; `Uhf` forces the unrestricted path even
     /// for a singlet.
     pub reference: Reference,
+    /// Which density the iteration starts from. The SCF equations have more than one
+    /// solution and the guess decides which one is reached, so this is not a mere
+    /// efficiency knob: see [`ScfGuess`].
+    pub guess: ScfGuess,
+    /// Whether to verify that the converged solution is the lowest one reachable, by
+    /// re-solving from other starting points. See [`ScfStability`].
+    pub stability: ScfStability,
     /// PM3 method variant: which post-SCF corrections (D3/H4/X) to add.
     pub variant: crate::corrections::Variant,
+    /// MOPAC's `MMOK` molecular-mechanics correction to the amide torsion.
+    ///
+    /// **Off by default, and MOPAC's default is on.** It is not part of the PM3
+    /// Hamiltonian — a classical `K·sin²(O=C–N–H)` term added to the heat of formation
+    /// afterwards — so leaving it off is what makes a pm3-rs number comparable to a
+    /// published PM3 one, and a MOPAC run comparable needs `NOMM`. Turn it on to reproduce
+    /// a MOPAC default run on a peptide or amide. See
+    /// [`crate::corrections::mmok`] for the form, the constant, and how both were measured.
+    pub mmok: bool,
     /// Level shift (eV) applied to the virtual space during diagonalization
     /// (Saunders–Hillier). It changes the SCF path/basin without changing the
     /// converged fixed point, preventing the variational collapse to
@@ -88,6 +217,17 @@ pub struct Pm3Options {
     /// pairs — whose response is negligible — are skipped. `None` (the default)
     /// computes the exact response and is **bit-identical** to the uncut result.
     pub hessian_cutoff: Option<f64>,
+    /// Iteration cap for the coupled-perturbed (CPHF) response behind an analytic Hessian,
+    /// infrared intensity, Born charge or Γ-point phonon calculation.
+    ///
+    /// Was a pair of hard-coded `400`s — one molecular, one periodic — which is a fine default
+    /// and a poor ceiling: a stiff response reports "did not converge" and the only remedy was to
+    /// edit the crate. Raising it is the first thing to try when a Hessian fails with a large
+    /// residual and the SCF underneath it converged cleanly.
+    ///
+    /// The DFPT path at finite `q` has its own cap, [`crate::DfptOptions::max_iter`], because it
+    /// is a different solver with a different convergence problem.
+    pub cphf_max_iter: usize,
     /// Soft memory budget (MiB) for Hessian workspaces. It bounds concurrent
     /// finite-difference jobs and CPHF response batches, and rejects an analytic
     /// Hessian before allocation if its resident occupied-virtual blocks alone
@@ -128,12 +268,16 @@ impl Default for Pm3Options {
             accelerator: ScfAccelerator::AdiisCdiis,
             adiis_switch: 0.1,
             reference: Reference::Auto,
+            guess: ScfGuess::Auto,
+            stability: ScfStability::Auto,
             variant: crate::corrections::Variant::Pm3,
+            mmok: false,
             level_shift_ev: 0.0,
             damping: 0.0,
             d_penalty_start: 0.0,
             d_penalty_iters: 0,
             hessian_cutoff: None,
+            cphf_max_iter: 400,
             hessian_memory_mb: 1024,
             integral_memory_mb: 0,
             scf_memory_mb: 512,
@@ -241,6 +385,14 @@ pub struct Pm3Result {
     pub converged: bool,
     /// True when the UHF (open-shell) path was used.
     pub unrestricted: bool,
+    /// How many distinct SCF paths were solved. `1` unless the stability search ran; see
+    /// [`ScfStability`].
+    pub scf_paths_tried: usize,
+    /// How much lower (eV) the returned solution is than the one the default path found
+    /// first. Non-zero means the SCF had converged to an excited solution and the search
+    /// caught it — worth logging, because it says the default path was not enough for this
+    /// molecule.
+    pub scf_improvement_ev: f64,
 }
 
 pub struct Pm3Calculator {
@@ -376,13 +528,26 @@ pub fn run_pm3(
             .atoms
             .iter()
             .any(|a| params.element(a.z).map(|e| e.has_d()).unwrap_or(false));
-    let run_scf = |shift: f64, damping: f64, d_pen: f64, d_pen_iters: usize| -> Result<ScfState> {
+    let run_scf = |shift: f64,
+                   damping: f64,
+                   d_pen: f64,
+                   d_pen_iters: usize,
+                   guess: ScfGuess,
+                   accelerator: ScfAccelerator,
+                   // Run the unrestricted iteration even for a closed shell. For
+                   // `n_alpha == n_beta` this solves the same equations by a different
+                   // path — see the `Unrestricted` rung of the stability battery.
+                   force_unrestricted: bool|
+     -> Result<ScfState> {
         let mut opts = options.clone();
         opts.level_shift_ev = shift;
         opts.damping = damping;
         opts.d_penalty_start = d_pen;
         opts.d_penalty_iters = d_pen_iters;
-        if use_uhf {
+        opts.guess = guess;
+        opts.accelerator = accelerator;
+        opts.use_diis = options.use_diis && accelerator != ScfAccelerator::None;
+        if use_uhf || force_unrestricted {
             uhf_loop(molecule, &basis, params, &core, n_alpha, n_beta, &opts)
         } else {
             rhf_loop(molecule, &basis, params, &core, n_alpha, &opts)
@@ -395,17 +560,160 @@ pub fn run_pm3(
     // tracks the physical basin down to the true (penalty-free) fixed point.
     // Level shift + damping alone cannot escape it (the collapse fills the low
     // metal-d orbitals, which a virtual-space shift leaves untouched).
-    let state = if options.level_shift_ev != 0.0 || options.damping != 0.0 {
-        run_scf(options.level_shift_ev, options.damping, 0.0, 0)?
+    let steered = options.level_shift_ev != 0.0 || options.damping != 0.0;
+    let first = if steered {
+        run_scf(
+            options.level_shift_ev,
+            options.damping,
+            0.0,
+            0,
+            options.guess,
+            options.accelerator,
+            false,
+        )?
     } else if has_open_d {
         // Anneal a 60 eV metal-d penalty over 60 iterations, with mild damping.
         // Recovers the physical basin for several open-shell TM halides; for the
         // remainder it is at worst neutral (the penalty vanishes before
         // convergence, so any converged result is a true fixed point).
-        run_scf(0.0, 0.3, 60.0, 60)?
+        run_scf(
+            0.0,
+            0.3,
+            60.0,
+            60,
+            options.guess,
+            options.accelerator,
+            false,
+        )?
     } else {
-        run_scf(0.0, 0.0, 0.0, 0)?
+        run_scf(0.0, 0.0, 0.0, 0, options.guess, options.accelerator, false)?
     };
+
+    // **Stability search.** See [`ScfStability`]. A converged SCF is one fixed point of a
+    // Fock operator that has several, and which one the iteration reaches is decided by
+    // where it started and how it was accelerated — not by which is the ground state. When
+    // the frontier gap is small enough that the ordering of the orbitals was in doubt, the
+    // same molecule is solved again from deliberately different starting points and the
+    // lowest converged energy is kept, which is the only defensible choice for a
+    // variational method.
+    let mut paths_tried = 1usize;
+    let mut state = first;
+    let search = match options.stability {
+        ScfStability::Off => false,
+        ScfStability::Always => !steered,
+        // The measurement behind the threshold is in `tests/mopac_oracle.rs`: across 161
+        // molecules every solution that disagreed with MOPAC had a frontier gap under
+        // 4 eV, and every one that agreed on the first try had one above 8 eV.
+        ScfStability::Auto => !steered && frontier_gap(&state) < STABILITY_GAP_EV,
+    };
+    let first_ev = state.electronic_ev;
+    if search {
+        let primary = if options.guess == ScfGuess::Core {
+            ScfGuess::Core
+        } else {
+            ScfGuess::Sad
+        };
+        let other = if primary == ScfGuess::Core {
+            ScfGuess::Sad
+        } else {
+            ScfGuess::Core
+        };
+        // Ordered cheapest-first and by how often each has been seen to win. Dropping the
+        // accelerator changes the path without changing the fixed point set; changing the
+        // guess changes which fixed point is in reach at all.
+        let (shift, damp, pen, pen_iters) = if has_open_d {
+            (0.0, 0.3, 60.0, 60)
+        } else {
+            (0.0, 0.0, 0.0, 0)
+        };
+        // `(guess, accelerator, level shift, damping, run unrestricted)`. Ordered
+        // cheapest-first and by how often each has been seen to win. Dropping the
+        // accelerator changes the path without changing the fixed point set; changing the
+        // guess changes which fixed point is in reach at all.
+        //
+        // The last two rungs run the **unrestricted** iteration on a closed shell. That is
+        // not a change of physics: with `n_alpha == n_beta` and a spin-symmetric guess the
+        // two spin densities stay equal and the result is a restricted solution, checked
+        // below and collapsed back. It is a change of *path* — the unrestricted loop shifts
+        // and damps a weight-1 density where the restricted one carries weight 2, and has
+        // its own extrapolator — and it is the only route found to `C2F4`'s ground state,
+        // which the restricted path misses by 166 kcal/mol from every guess.
+        //
+        // The negative shift there is deliberate. A level shift of either sign leaves the
+        // fixed points untouched (Saunders–Hillier); a negative one lowers the virtual
+        // space and so *encourages* the occupied–virtual mixing that a solution trapped
+        // above its ground state needs in order to fall out of it.
+        let closed_shell = !use_uhf;
+        for (guess, accelerator, rung_shift, rung_damp, unrestricted) in [
+            (primary, ScfAccelerator::None, shift, damp, false),
+            (other, options.accelerator, shift, damp, false),
+            (other, ScfAccelerator::None, shift, damp, false),
+            (
+                ScfGuess::SymmetryBroken,
+                options.accelerator,
+                shift,
+                damp,
+                false,
+            ),
+            (
+                ScfGuess::SymmetryBroken,
+                ScfAccelerator::None,
+                shift,
+                damp,
+                false,
+            ),
+            (
+                ScfGuess::SymmetryBroken,
+                ScfAccelerator::None,
+                -2.0,
+                damp,
+                closed_shell,
+            ),
+            (primary, ScfAccelerator::Cdiis, shift, 0.85, closed_shell),
+        ] {
+            // The last two rungs only exist for the closed-shell case; for an open shell
+            // they would repeat a rung already run.
+            if unrestricted != closed_shell {
+                continue;
+            }
+            paths_tried += 1;
+            let Ok(mut candidate) = run_scf(
+                rung_shift,
+                rung_damp,
+                pen,
+                pen_iters,
+                guess,
+                accelerator,
+                unrestricted,
+            ) else {
+                continue;
+            };
+            if !candidate.converged {
+                continue;
+            }
+            // An unrestricted run of a closed shell that stayed spin-pure *is* a restricted
+            // solution, and saying otherwise would hand the caller a spin density of zeros
+            // and a second orbital set identical to the first. One that did not stay
+            // spin-pure is a broken-symmetry state of a different kind and is not
+            // comparable to the restricted incumbent, so it is discarded rather than
+            // silently returned for a singlet.
+            if unrestricted {
+                match spin_purity(&candidate) {
+                    Some(residual) if residual < SPIN_PURE_TOL => {
+                        collapse_to_restricted(&mut candidate)
+                    }
+                    _ => continue,
+                }
+            }
+            // Compare the electronic energy alone: every path here is the same molecule at
+            // the same geometry, so the core-core term is identical and cancels.
+            if !state.converged || candidate.electronic_ev < state.electronic_ev - STABILITY_TOL_EV
+            {
+                state = candidate;
+            }
+        }
+    }
+    let scf_improvement_ev = (first_ev - state.electronic_ev).max(0.0);
     if timing {
         eprintln!(
             "[timing] SCF ({} iters): {:.3}s",
@@ -430,7 +738,8 @@ pub fn run_pm3(
     );
     let electronic_ev = state.electronic_ev + capped_bond_ev;
     // Post-SCF classical corrections (D3/H4/X) per the method variant.
-    let correction_ev = crate::corrections::correction_energy(molecule, options.variant);
+    let correction_ev =
+        crate::corrections::correction_energy_with_mmok(molecule, options.variant, options.mmok);
     let total_ev = electronic_ev + core_ev + correction_ev;
 
     let mut e_isol_sum = 0.0;
@@ -446,6 +755,7 @@ pub fn run_pm3(
         return Err(Pm3Error::ScfNotConverged {
             iterations: state.iterations,
             error: state.last_change,
+            diagnosis: None,
         });
     }
 
@@ -524,6 +834,8 @@ pub fn run_pm3(
         core_ev,
         total_ev,
         heat_of_formation_kcal,
+        scf_paths_tried: paths_tried,
+        scf_improvement_ev,
         charges,
         dipole_debye,
         dipole_magnitude,
@@ -566,6 +878,104 @@ fn sad_density(molecule: &Molecule, basis: &Basis, params: &Pm3Parameters) -> Re
         }
     }
     Ok(p)
+}
+
+/// A SAD density with one atom's `s`/`p` balance tilted, to break a spatial symmetry.
+///
+/// SAD and the core-Hamiltonian guess are both as symmetric as the molecule is, so on a
+/// symmetric molecule they can only reach solutions of that symmetry — and when the true
+/// ground state is symmetry-broken, neither finds it however long it iterates. Tilting one
+/// atom's shell populations removes that constraint.
+///
+/// The atom chosen is the one with the largest valence-`p` population, and the tilt moves
+/// a fifth of an electron from `p_z` into `p_x`. It is a *guess*: the perturbation is not
+/// carried into the Fock operator, so whatever fixed point is reached is a fixed point of
+/// the true Fock, and the choice of atom is deterministic so a run is reproducible.
+fn symmetry_broken_density(
+    molecule: &Molecule,
+    basis: &Basis,
+    params: &Pm3Parameters,
+) -> Result<Matrix> {
+    let mut p = sad_density(molecule, basis, params)?;
+    let mut target = None;
+    let mut best = 0.0;
+    for (ia, atom) in molecule.atoms.iter().enumerate() {
+        let elem = params.element(atom.z)?;
+        if basis.atom_norb[ia] >= 4 && elem.occ_p > best {
+            best = elem.occ_p;
+            target = Some(ia);
+        }
+    }
+    if let Some(ia) = target {
+        let off = basis.atom_offset[ia];
+        let tilt = 0.2_f64.min(p[(off + 3, off + 3)]);
+        p[(off + 3, off + 3)] -= tilt;
+        p[(off + 1, off + 1)] += tilt;
+    }
+    Ok(p)
+}
+
+/// The starting density for the restricted path.
+fn rhf_guess(
+    molecule: &Molecule,
+    basis: &Basis,
+    params: &Pm3Parameters,
+    core: &CoreHamiltonian,
+    n_occ: usize,
+    guess: ScfGuess,
+) -> Result<Matrix> {
+    Ok(match guess {
+        ScfGuess::Auto | ScfGuess::Sad => sad_density(molecule, basis, params)?,
+        ScfGuess::Core => {
+            let (_, c) = symmetric_eigen(&core.h_core)?;
+            density_from_coeff(&c, n_occ, 2.0)
+        }
+        ScfGuess::SymmetryBroken => symmetry_broken_density(molecule, basis, params)?,
+    })
+}
+
+/// The starting `(P_α, P_β)` pair for the unrestricted path.
+fn uhf_guess(
+    molecule: &Molecule,
+    basis: &Basis,
+    params: &Pm3Parameters,
+    core: &CoreHamiltonian,
+    n_alpha: usize,
+    n_beta: usize,
+    guess: ScfGuess,
+) -> Result<(Matrix, Matrix)> {
+    // The core-Hamiltonian route fills the same orbitals to two different depths, which
+    // breaks spin symmetry without fractionally removing charge from every atom the way a
+    // scaled SAD guess does. The density routes scale instead, which is the cruder split
+    // but starts from a physically sensible charge distribution.
+    let scaled = |p: &Matrix| -> (Matrix, Matrix) {
+        let n_elec = (n_alpha + n_beta) as f64;
+        let (fa, fb) = if n_elec > 0.0 {
+            (n_alpha as f64 / n_elec, n_beta as f64 / n_elec)
+        } else {
+            (0.5, 0.5)
+        };
+        let mut pa = p.clone();
+        let mut pb = p.clone();
+        for v in pa.as_mut_slice() {
+            *v *= fa;
+        }
+        for v in pb.as_mut_slice() {
+            *v *= fb;
+        }
+        (pa, pb)
+    };
+    Ok(match guess {
+        ScfGuess::Core => {
+            let (_, c) = symmetric_eigen(&core.h_core)?;
+            (
+                density_from_coeff(&c, n_alpha, 1.0),
+                density_from_coeff(&c, n_beta, 1.0),
+            )
+        }
+        ScfGuess::Auto | ScfGuess::Sad => scaled(&sad_density(molecule, basis, params)?),
+        ScfGuess::SymmetryBroken => scaled(&symmetry_broken_density(molecule, basis, params)?),
+    })
 }
 
 /// Build a density `P = w Σ_{k<n_occ} c_k c_kᵀ` from MO coefficients (`w` = 2 for RHF, 1 for UHF).
@@ -775,7 +1185,7 @@ fn rhf_loop(
     options: &Pm3Options,
 ) -> Result<ScfState> {
     let nao = basis.nao;
-    let mut density = sad_density(molecule, basis, params)?; // SAD initial guess
+    let mut density = rhf_guess(molecule, basis, params, core, n_occ, options.guess)?;
     let mut e_old = 0.0;
     let mut mo_energies = vec![0.0; nao];
     let mut mo_coeff = Matrix::zeros(nao, nao);
@@ -930,13 +1340,15 @@ fn uhf_loop(
     } else {
         Vec::new()
     };
-    // SAD guess split by spin population; the different α/β aufbau counts break spin symmetry.
-    // Use a common core-Hamiltonian orbital guess. Unequal occupations break
-    // spin symmetry without fractionally removing charge from every atom, as
-    // a globally scaled SAD guess would do for radicals.
-    let (_, guess_coefficients) = symmetric_eigen(&core.h_core)?;
-    let mut pa = density_from_coeff(&guess_coefficients, n_alpha, 1.0);
-    let mut pb = density_from_coeff(&guess_coefficients, n_beta, 1.0);
+    let (mut pa, mut pb) = uhf_guess(
+        molecule,
+        basis,
+        params,
+        core,
+        n_alpha,
+        n_beta,
+        options.guess,
+    )?;
     let mut e_old = 0.0;
     let mut eps_a = vec![0.0; nao];
     let mut c_a = Matrix::zeros(nao, nao);

@@ -49,6 +49,25 @@ use crate::system::Molecule;
 /// Primitives per shell. Chosen by measurement — see the test — not by analogy with STO-6G.
 const PRIMITIVES: usize = 14;
 
+/// Which radial form the basis section carries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MoldenBasis {
+    /// A Gaussian expansion of each Slater shell, written as `[GTO]`. **The default**, and what
+    /// every viewer reads.
+    #[default]
+    Gto,
+    /// The Slater functions themselves, written as `[STO]`.
+    ///
+    /// Kept for compatibility and **not** the default. PM3's orbitals are exactly one
+    /// uncontracted Slater function per shell, so this is the more faithful description of what
+    /// the model actually names — and almost no viewer implements the section, which is why the
+    /// Gaussian expansion exists at all. The layout mirrors `[GTO]`'s (an atom index line, then
+    /// one shell line per shell, then its exponent), because that is the parallel Molden's own
+    /// documentation draws; a reader that does not implement `[STO]` will skip it, and one that
+    /// does may expect a different field order. Use `Gto` unless you know your viewer.
+    Sto,
+}
+
 /// The even-tempered series `α_k = α_min · ratio^k`, in units of `ζ²`.
 ///
 /// A Slater orbital decays as `e^{−ζr}` and a Gaussian as `e^{−αr²}`, so reproducing both the
@@ -64,9 +83,36 @@ const ALPHA_SMOOTH: f64 = 300.0;
 
 /// Gaussian exponents (in units of `ζ²`) and the contraction coefficients fitting one
 /// `(n, l)` Slater shell.
+#[derive(Clone, Copy)]
 struct Expansion {
     exponents: [f64; PRIMITIVES],
     coefficients: [f64; PRIMITIVES],
+}
+
+/// [`fit`], memoized on `(n, l)`.
+///
+/// The fit is a 20 000-point quadrature and a `14 × 14` eigendecomposition, and it depends on
+/// nothing but the shell: `ζ` enters afterwards, by scaling. It was being redone for every shell
+/// of every atom, so a hundred carbons paid for the same two fits a hundred times. PM3 reaches at
+/// most eleven distinct `(n, l)` pairs.
+fn cached_fit(n: usize, l: usize) -> Result<Expansion> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<HashMap<(usize, usize), Expansion>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // A poisoned lock means another thread panicked mid-fit. The table is a pure function of its
+    // key, so whatever is in it is still correct and the entry can simply be recomputed.
+    if let Ok(table) = cache.lock() {
+        if let Some(hit) = table.get(&(n, l)) {
+            return Ok(*hit);
+        }
+    }
+    let made = fit(n, l)?;
+    if let Ok(mut table) = cache.lock() {
+        table.insert((n, l), made);
+    }
+    Ok(made)
 }
 
 /// The radial part of a normalized Slater orbital, `N r^{n−1} e^{−r}` at `ζ = 1`.
@@ -205,6 +251,18 @@ pub fn molden_string(
     params: &Pm3Parameters,
     result: &Pm3Result,
 ) -> Result<String> {
+    molden_string_with(molecule, params, result, MoldenBasis::Gto)
+}
+
+/// [`molden_string`], choosing which radial form the basis section carries.
+///
+/// See [`MoldenBasis`]. `Gto` is what [`molden_string`] writes and what a viewer will read.
+pub fn molden_string_with(
+    molecule: &Molecule,
+    params: &Pm3Parameters,
+    result: &Pm3Result,
+    form: MoldenBasis,
+) -> Result<String> {
     let basis = Basis::build(molecule, params)?;
     let mut out = String::from("[Molden Format]\n");
     out.push_str("[Title]\n pm3-rs wavefunction (NDDO orbitals in a Slater basis; see docs)\n");
@@ -224,7 +282,10 @@ pub fn molden_string(
         ));
     }
 
-    out.push_str("[GTO]\n");
+    out.push_str(match form {
+        MoldenBasis::Gto => "[GTO]\n",
+        MoldenBasis::Sto => "[STO]\n",
+    });
     for (index, atom) in molecule.atoms.iter().enumerate() {
         let element = params.element(atom.z)?;
         shell_order(element.n_orb)?;
@@ -232,6 +293,7 @@ pub fn molden_string(
         if element.n_orb >= 1 {
             write_shell(
                 &mut out,
+                form,
                 "s",
                 element.n_s.max(1) as usize,
                 0,
@@ -241,6 +303,7 @@ pub fn molden_string(
         if element.n_orb >= 4 {
             write_shell(
                 &mut out,
+                form,
                 "p",
                 element.n_p.max(2) as usize,
                 1,
@@ -281,24 +344,69 @@ pub fn molden_string(
     Ok(out)
 }
 
-/// One shell's primitives, with the `ζ²` scaling applied.
-fn write_shell(out: &mut String, label: &str, n: usize, l: usize, zeta: f64) -> Result<()> {
+/// One shell, either as its Gaussian expansion or as the Slater function itself.
+///
+/// A zero `ζ` on a shell the element *declares* is an error rather than a silent skip. It cannot
+/// happen with the shipped parameters — `n_orb` is 4 only when `zeta_p > 0` — but if it ever did,
+/// skipping would write one basis function into the section while `[MO]` wrote four coefficient
+/// rows for the atom, and **every AO index after it would be off by three**. That is the exact
+/// shape of "the occupied orbitals do not line up with the molecular orbitals", and it would be
+/// invisible in the file: a viewer would draw the wrong thing rather than refuse.
+fn write_shell(
+    out: &mut String,
+    form: MoldenBasis,
+    label: &str,
+    n: usize,
+    l: usize,
+    zeta: f64,
+) -> Result<()> {
     if zeta <= 0.0 {
-        // Hydrogen carries a `zeta_p` of zero; that channel does not exist and writing it would
-        // put a Gaussian of exponent zero into the file.
-        return Ok(());
+        return Err(Pm3Error::InvalidInput(format!(
+            "the element declares a {label} shell but its Slater exponent is {zeta}. Writing no \
+             basis function for a shell the [MO] section has coefficients for would shift every \
+             AO index after this atom, so the file is refused rather than written misaligned."
+        )));
     }
-    let expansion = fit(n, l)?;
-    out.push_str(&format!(" {label} {PRIMITIVES:>4} 1.00\n"));
-    let scale = zeta * zeta;
-    for (alpha, coefficient) in expansion.exponents.iter().zip(&expansion.coefficients) {
-        out.push_str(&format!(
-            " {:>20.10e} {:>20.10e}\n",
-            alpha * scale,
-            coefficient
-        ));
+    match form {
+        MoldenBasis::Sto => {
+            // One uncontracted Slater function, which is what PM3 actually names.
+            out.push_str(&format!(" {label}    1 1.00\n"));
+            out.push_str(&format!(" {} {}\n", fortran(zeta), fortran(1.0)));
+        }
+        MoldenBasis::Gto => {
+            let expansion = cached_fit(n, l)?;
+            out.push_str(&format!(" {label} {PRIMITIVES:>4} 1.00\n"));
+            let scale = zeta * zeta;
+            for (alpha, coefficient) in expansion.exponents.iter().zip(&expansion.coefficients) {
+                out.push_str(&format!(
+                    " {} {}\n",
+                    fortran(alpha * scale),
+                    fortran(*coefficient)
+                ));
+            }
+        }
     }
     Ok(())
+}
+
+/// A float in the `1.2345678901E+02` form Fortran list-directed input expects.
+///
+/// Rust's `{:e}` gives `1.2345678901e2` — no sign on the exponent, no padding, and a lowercase
+/// `e`. Most readers cope; the ones that do not are Fortran, which is most of the programs that
+/// read this format. Writing the conventional form costs nothing and removes the question.
+fn fortran(value: f64) -> String {
+    let formatted = format!("{value:>20.10E}");
+    // Rust writes `E2` and `E-2`; Fortran readers expect `E+02` and `E-02`.
+    match formatted.rsplit_once('E') {
+        Some((mantissa, exponent)) => {
+            let (sign, digits) = match exponent.strip_prefix('-') {
+                Some(rest) => ('-', rest),
+                None => ('+', exponent),
+            };
+            format!("{mantissa}E{sign}{digits:0>2}")
+        }
+        None => formatted,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -324,9 +432,14 @@ fn write_orbitals(
     }
 
     for mo in 0..basis.nao {
+        // `Sym=` is a *label*, not an index. PM3 carries no point group, so there is no
+        // irreducible representation to name and every orbital gets the placeholder `a` — which
+        // is what MOPAC writes for the same reason. It used to be the bare integer `mo + 1`, and
+        // a reader that parses the label as `<number><irrep>` reads that as a symmetry species
+        // with an empty name.
+        let label = format!("{}a", mo + 1);
         out.push_str(&format!(
-            " Sym= {}\n Ene= {:>18.10}\n Spin= {spin}\n Occup= {:>10.6}\n",
-            mo + 1,
+            " Sym= {label}\n Ene= {:>18.10}\n Spin= {spin}\n Occup= {:>10.6}\n",
             // Molden wants Hartree; this crate works in eV.
             energies[mo] * crate::constants::EV_TO_HARTREE,
             if mo < n_occupied { occupancy } else { 0.0 }
@@ -448,6 +561,232 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Read the file back and check that the basis section and the orbital section agree.
+    ///
+    /// This is the test for "the occupied orbitals do not line up with the molecular orbitals".
+    /// That symptom has exactly one mechanical cause in a Molden file — the number of basis
+    /// functions the basis section declares disagreeing with the number of coefficient rows each
+    /// `[MO]` block writes — and it is invisible from the inside, because both halves are
+    /// individually well formed. So the check parses the document as a viewer would and compares
+    /// the two counts, rather than asserting on how it was generated.
+    ///
+    /// Run over **both** basis forms. `[STO]` is reachable from the CLI and from Python, and a
+    /// shell that is written into one section and not the other is exactly the mismatch above —
+    /// the coefficients would be right and the basis they index into wrong.
+    #[test]
+    fn the_basis_section_and_the_orbital_section_agree_on_the_basis_size() {
+        for (form, section) in [(MoldenBasis::Gto, "[GTO]"), (MoldenBasis::Sto, "[STO]")] {
+            check_basis_and_orbitals_agree(form, section);
+        }
+    }
+
+    fn check_basis_and_orbitals_agree(form: MoldenBasis, section: &str) {
+        for (label, molecule, options) in [
+            ("water", water(), Pm3Options::default()),
+            (
+                "methyl radical",
+                Molecule::from_xyz_str(
+                    "4\nmethyl\nC 0.0 0.0 0.0\nH 0.0 1.078 0.0\nH 0.9336 -0.539 0.0\n\
+                     H -0.9336 -0.539 0.0\n",
+                    0.0,
+                )
+                .unwrap()
+                .with_multiplicity(2),
+                Pm3Options {
+                    multiplicity: 2,
+                    ..Pm3Options::default()
+                },
+            ),
+        ] {
+            let params = Pm3Parameters::standard().unwrap();
+            let result = run_pm3(&molecule, &params, &options).unwrap();
+            let basis = Basis::build(&molecule, &params).unwrap();
+            let text = molden_string_with(&molecule, &params, &result, form).unwrap();
+            let label = &format!("{label} {section}");
+
+            // Count basis functions the way a reader does: walk the basis section, and for each
+            // shell line add the number of functions that shell carries.
+            let mut declared = 0usize;
+            let mut in_gto = false;
+            for line in text.lines() {
+                if line.starts_with('[') {
+                    in_gto = line.starts_with(section);
+                    continue;
+                }
+                if !in_gto {
+                    continue;
+                }
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                // A shell line is `<label> <nprim> <scale>`; anything else is an atom index line,
+                // a primitive, or the blank separator.
+                if fields.len() == 3 && fields[1].parse::<usize>().is_ok() {
+                    declared += match fields[0] {
+                        "s" => 1,
+                        "p" => 3,
+                        other => panic!("{label}: unexpected shell label {other}"),
+                    };
+                }
+            }
+            assert_eq!(
+                declared, basis.nao,
+                "{label}: the basis section declares {declared} basis functions, the calculation \
+                 has {}. Every AO index after the first mismatch is shifted and the viewer draws \
+                 the wrong orbital.",
+                basis.nao
+            );
+
+            // And each [MO] block writes exactly that many coefficient rows.
+            let mut blocks = 0usize;
+            let mut rows = 0usize;
+            let mut in_mo = false;
+            for line in text.lines() {
+                if line.starts_with('[') {
+                    in_mo = line.starts_with("[MO]");
+                    continue;
+                }
+                if !in_mo {
+                    continue;
+                }
+                if line.starts_with(" Sym=") {
+                    if blocks > 0 {
+                        assert_eq!(
+                            rows, declared,
+                            "{label}: an [MO] block has {rows} coefficients against {declared} \
+                             declared basis functions"
+                        );
+                    }
+                    blocks += 1;
+                    rows = 0;
+                } else if line.starts_with(" Ene=")
+                    || line.starts_with(" Spin=")
+                    || line.starts_with(" Occup=")
+                {
+                    continue;
+                } else if !line.trim().is_empty() {
+                    rows += 1;
+                }
+            }
+            assert_eq!(rows, declared, "{label}: the last [MO] block is short");
+            let spins = if result.unrestricted { 2 } else { 1 };
+            assert_eq!(
+                blocks,
+                spins * declared,
+                "{label}: expected {spins} × {declared} orbitals"
+            );
+
+            // The occupied block is the *leading* one, which is what `Occup=` claims: energies
+            // ascending, and no occupied orbital above an empty one.
+            let energies: Vec<f64> = text
+                .lines()
+                .filter_map(|l| l.strip_prefix(" Ene="))
+                .map(|v| v.trim().parse::<f64>().unwrap())
+                .collect();
+            let occupations: Vec<f64> = text
+                .lines()
+                .filter_map(|l| l.strip_prefix(" Occup="))
+                .map(|v| v.trim().parse::<f64>().unwrap())
+                .collect();
+            assert_eq!(energies.len(), occupations.len());
+            // Per spin block, ascending and aufbau-filled.
+            for chunk in energies.chunks(declared).zip(occupations.chunks(declared)) {
+                let (e, f) = chunk;
+                for pair in e.windows(2) {
+                    assert!(
+                        pair[0] <= pair[1] + 1e-12,
+                        "{label}: energies not ascending"
+                    );
+                }
+                let mut seen_empty = false;
+                for value in f {
+                    if *value == 0.0 {
+                        seen_empty = true;
+                    } else {
+                        assert!(
+                            !seen_empty,
+                            "{label}: an occupied orbital sits above an empty one, so `Occup=` \
+                             and the energy order disagree"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The `[STO]` form is opt-in, and describes the same wavefunction.
+    #[test]
+    fn the_slater_form_is_available_and_is_not_the_default() {
+        let molecule = water();
+        let params = Pm3Parameters::standard().unwrap();
+        let result = run_pm3(&molecule, &params, &Pm3Options::default()).unwrap();
+
+        let gto = molden_string(&molecule, &params, &result).unwrap();
+        assert!(
+            gto.contains("[GTO]") && !gto.contains("[STO]"),
+            "GTO is the default"
+        );
+
+        let sto = molden_string_with(&molecule, &params, &result, MoldenBasis::Sto).unwrap();
+        assert!(sto.contains("[STO]") && !sto.contains("[GTO]"));
+        // One Slater function per shell rather than fourteen primitives.
+        assert_eq!(
+            sto.matches(" s    1 1.00").count(),
+            3,
+            "one s shell per atom"
+        );
+        assert_eq!(sto.matches(" p    1 1.00").count(), 1, "oxygen alone has p");
+        // The orbital section is the same either way: only the radial description changed.
+        let orbitals = |text: &str| text[text.find("[MO]").unwrap()..].to_string();
+        assert_eq!(orbitals(&gto), orbitals(&sto));
+    }
+
+    /// Numbers come out in the exponent form Fortran list-directed input expects.
+    #[test]
+    fn exponents_are_written_in_the_conventional_form() {
+        assert_eq!(fortran(240.0).trim(), "2.4000000000E+02");
+        assert_eq!(fortran(0.0024).trim(), "2.4000000000E-03");
+        assert_eq!(fortran(-1.5).trim(), "-1.5000000000E+00");
+        let molecule = water();
+        let params = Pm3Parameters::standard().unwrap();
+        let result = run_pm3(&molecule, &params, &Pm3Options::default()).unwrap();
+        let text = molden_string(&molecule, &params, &result).unwrap();
+
+        // Only the primitive lines of the basis section, since the title is prose and the atom
+        // lines carry element symbols.
+        let mut in_gto = false;
+        let mut primitives = 0usize;
+        for line in text.lines() {
+            if line.starts_with('[') {
+                in_gto = line.starts_with("[GTO]");
+                continue;
+            }
+            if !in_gto || line.trim().is_empty() {
+                continue;
+            }
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() == 2 && fields[0].contains('E') {
+                primitives += 1;
+                for field in fields {
+                    assert!(
+                        !field.contains('e'),
+                        "a lowercase exponent survived: {line}"
+                    );
+                    let (_, exponent) = field.rsplit_once('E').unwrap();
+                    assert!(
+                        exponent.len() >= 3
+                            && (exponent.starts_with('+') || exponent.starts_with('-')),
+                        "exponent {exponent} is not the signed two-digit form: {line}"
+                    );
+                    field
+                        .replace('E', "e")
+                        .parse::<f64>()
+                        .expect("still a number");
+                }
+            }
+        }
+        // Water: an s and a p shell on oxygen, an s on each hydrogen, at PRIMITIVES each.
+        assert_eq!(primitives, 4 * PRIMITIVES);
     }
 
     /// An open-shell system writes both spin sets, which is the whole reason `Pm3Result` keeps

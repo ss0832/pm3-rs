@@ -35,17 +35,33 @@ fn parse_reference(reference: &str) -> PyResult<Reference> {
     }
 }
 
-/// Parse the `method` string into a correction [`Variant`]
-/// ("pm3" | "pm3-d3" | "pm3-d3h4" | "pm3-d3h4x", case-insensitive).
-fn parse_variant(method: &str) -> PyResult<Variant> {
-    if method.is_empty() {
-        return Ok(Variant::Pm3);
+/// Parse the `method` string into a correction [`Variant`] and the MMOK flag.
+///
+/// The variant is `"pm3" | "pm3-d3" | "pm3-d3h4" | "pm3-d3h4x"`, case-insensitive. Any of
+/// them may carry a `+mmok` suffix — `"pm3+mmok"`, `"pm3-d3h4+mmok"` — which switches on
+/// MOPAC's molecular-mechanics amide correction. It rides on `method` rather than getting
+/// its own keyword because it is the same kind of thing as the rest of this string: a
+/// post-SCF correction term, selected the same way, reaching every entry point at once.
+///
+/// It is **off unless asked for**, and MOPAC's default is on. See
+/// [`crate::corrections::mmok`] for why that difference is deliberate.
+fn parse_method(method: &str) -> PyResult<(Variant, bool)> {
+    let trimmed = method.trim();
+    let lower = trimmed.to_ascii_lowercase().replace([' ', '_'], "-");
+    let (base, mmok) = match lower.strip_suffix("+mmok") {
+        Some(rest) => (rest.to_string(), true),
+        None => (lower, false),
+    };
+    if base.is_empty() {
+        return Ok((Variant::Pm3, mmok));
     }
-    Variant::parse(method).ok_or_else(|| {
+    let variant = Variant::parse(&base).ok_or_else(|| {
         PyValueError::new_err(format!(
-            "method must be 'pm3', 'pm3-d3', 'pm3-d3h4' or 'pm3-d3h4x' (got {method:?})"
+            "method must be 'pm3', 'pm3-d3', 'pm3-d3h4' or 'pm3-d3h4x', each optionally with a \
+             '+mmok' suffix for MOPAC's amide correction (got {method:?})"
         ))
-    })
+    })?;
+    Ok((variant, mmok))
 }
 
 /// Attach a cell to a molecule, converting Ångström to Bohr.
@@ -156,14 +172,21 @@ fn build_molecule(
     })
 }
 
-fn options(charge: f64, multiplicity: usize, reference: Reference, variant: Variant) -> Pm3Options {
-    Pm3Options {
+fn options(
+    charge: f64,
+    multiplicity: usize,
+    reference: Reference,
+    method: &str,
+) -> PyResult<Pm3Options> {
+    let (variant, mmok) = parse_method(method)?;
+    Ok(Pm3Options {
         charge,
         multiplicity,
         reference,
         variant,
+        mmok,
         ..Pm3Options::default()
-    }
+    })
 }
 
 /// A uniform external field in **volts per Angstrom**, the unit MOPAC's own `FIELD=` keyword
@@ -193,12 +216,32 @@ fn options_with_field(
     charge: f64,
     multiplicity: usize,
     reference: Reference,
-    variant: Variant,
+    method: &str,
     field: Option<Vec<f64>>,
 ) -> PyResult<Pm3Options> {
     Ok(Pm3Options {
         field: parse_field(field)?,
-        ..options(charge, multiplicity, reference, variant)
+        ..options(charge, multiplicity, reference, method)?
+    })
+}
+
+/// Override the coupled-perturbed iteration cap, for the entry points that run one.
+///
+/// `None` keeps [`Pm3Options::default`]'s 400. Only the functions behind a CPHF solve take this
+/// argument — a Hessian, its frequencies, an infrared spectrum, Γ phonons, Born charges and the
+/// dielectric tensor. A single point has no response to converge and is not offered a knob that
+/// would do nothing.
+fn with_cphf_cap(base: Pm3Options, cap: Option<usize>) -> PyResult<Pm3Options> {
+    let Some(limit) = cap else { return Ok(base) };
+    if limit == 0 {
+        return Err(PyValueError::new_err(
+            "cphf_max_iter must be at least 1; zero is a solver that never iterates and never \
+             converges, which reports failure rather than skipping the response",
+        ));
+    }
+    Ok(Pm3Options {
+        cphf_max_iter: limit,
+        ..base
     })
 }
 
@@ -226,7 +269,7 @@ fn single_point(
             charge,
             multiplicity,
             parse_reference(reference)?,
-            parse_variant(method)?,
+            method,
             field,
         )?,
     )
@@ -272,7 +315,7 @@ fn gradient(
             charge,
             multiplicity,
             parse_reference(reference)?,
-            parse_variant(method)?,
+            method,
             field,
         )?,
     )
@@ -332,7 +375,7 @@ fn forces(
             charge,
             multiplicity,
             parse_reference(reference)?,
-            parse_variant(method)?,
+            method,
             field,
         )?,
     )
@@ -383,8 +426,15 @@ fn forces(
 }
 
 /// L-BFGS geometry optimization. Returns optimized positions in Ångström.
+///
+/// `max_steps` and `force_tol` (eV/Å) are the same two controls `relax` and
+/// `divide_and_conquer_optimize` take. `force_tol=None` keeps [`OptOptions::default`]'s
+/// 1e-3 eV/Bohr rather than substituting the other two functions' 0.02 eV/Å, which is
+/// 10× looser — adding a knob is not a reason to move the answer for callers who do not
+/// touch it.
 #[pyfunction]
-#[pyo3(signature = (numbers, positions, charge=0.0, multiplicity=1, reference="auto", method="pm3", field=None))]
+#[pyo3(signature = (numbers, positions, charge=0.0, multiplicity=1, reference="auto",
+                    method="pm3", field=None, max_steps=200, force_tol=None))]
 #[allow(clippy::too_many_arguments)]
 fn optimize(
     py: Python<'_>,
@@ -395,9 +445,12 @@ fn optimize(
     reference: &str,
     method: &str,
     field: Option<Vec<f64>>,
+    max_steps: usize,
+    force_tol: Option<f64>,
 ) -> PyResult<PyObject> {
     let mol = build_molecule(&numbers, &positions, charge, multiplicity)?;
     let params = Pm3Parameters::standard().map_err(to_py_err)?;
+    let defaults = OptOptions::default();
     let res = opt_geom(
         &mol,
         &params,
@@ -405,10 +458,14 @@ fn optimize(
             charge,
             multiplicity,
             parse_reference(reference)?,
-            parse_variant(method)?,
+            method,
             field,
         )?,
-        &OptOptions::default(),
+        &OptOptions {
+            max_iter: max_steps,
+            gtol: force_tol.map_or(defaults.gtol, crate::constants::force_tol_to_au),
+            ..defaults
+        },
     )
     .map_err(to_py_err)?;
     let coords: Vec<[f64; 3]> = res
@@ -421,17 +478,26 @@ fn optimize(
         })
         .collect();
     let d = PyDict::new(py);
-    d.set_item("positions_angstrom", coords)?;
+    // The two optimizers -- this one and `relax` -- return the **same** key set, differing only
+    // in the periodic extras. They used to be disjoint: this one had `positions_angstrom` /
+    // `energy_hartree` / `iterations` and no `energy_ev`, `relax` had `positions` / `energy_ev` /
+    // `steps` and no heat of formation, so a caller who had just read `energy_ev` off every other
+    // function in the module got a `KeyError` from the one call that had done the most work.
+    // Neither name is wrong, so both are carried rather than one being renamed.
+    d.set_item("positions_angstrom", coords.clone())?;
+    d.set_item("positions", coords)?;
     d.set_item("energy_hartree", res.scf.total_ev * EV_TO_HARTREE)?;
+    d.set_item("energy_ev", res.scf.total_ev)?;
     d.set_item("heat_of_formation_kcal", res.scf.heat_of_formation_kcal)?;
     d.set_item("converged", res.converged)?;
     d.set_item("iterations", res.iterations)?;
+    d.set_item("steps", res.iterations)?;
     Ok(d.into())
 }
 
 /// Harmonic vibrational frequencies (cm⁻¹) at the given geometry.
 #[pyfunction]
-#[pyo3(signature = (numbers, positions, charge=0.0, multiplicity=1, reference="auto", method="pm3", field=None))]
+#[pyo3(signature = (numbers, positions, charge=0.0, multiplicity=1, reference="auto", method="pm3", field=None, cphf_max_iter=None))]
 #[allow(clippy::too_many_arguments)]
 fn frequencies(
     py: Python<'_>,
@@ -442,18 +508,22 @@ fn frequencies(
     reference: &str,
     method: &str,
     field: Option<Vec<f64>>,
+    cphf_max_iter: Option<usize>,
 ) -> PyResult<PyObject> {
     let mol = build_molecule(&numbers, &positions, charge, multiplicity)?;
     let params = Pm3Parameters::standard().map_err(to_py_err)?;
     let vib = crate::hessian::vibrational_analysis(
         &mol,
         &params,
-        &options_with_field(
-            charge,
-            multiplicity,
-            parse_reference(reference)?,
-            parse_variant(method)?,
-            field,
+        &with_cphf_cap(
+            options_with_field(
+                charge,
+                multiplicity,
+                parse_reference(reference)?,
+                method,
+                field,
+            )?,
+            cphf_max_iter,
         )?,
         1.0e-3,
     )
@@ -476,6 +546,135 @@ fn frequencies(
     d.set_item("eigenvalues", vib.eigenvalues)?;
     d.set_item("modes", modes)?;
     d.set_item("masses", masses)?;
+    // How many of the leading zeros are rigid-body directions, and what the Hessian said about
+    // them before they were projected out. The first is a count taken from the geometry, so a
+    // caller no longer has to guess it by looking for small numbers; the second is the quality
+    // measure that guessing used to double as.
+    d.set_item("n_rigid", vib.n_rigid)?;
+    d.set_item("rigid_residual_cm", vib.rigid_residual_cm)?;
+    Ok(d.into())
+}
+
+/// Molecular orbital energies, coefficients and occupations.
+///
+/// `Pm3Result` has carried all of this since the beginning and none of it was reachable from
+/// Python: `single_point` returned `homo_ev` and `lumo_ev` and nothing else, so the only way to
+/// see a spectrum or a coefficient was to write a Molden file and parse it back.
+#[pyfunction]
+#[pyo3(signature = (numbers, positions, charge=0.0, multiplicity=1, reference="auto", method="pm3", field=None))]
+#[allow(clippy::too_many_arguments)]
+fn orbitals(
+    py: Python<'_>,
+    numbers: Vec<u8>,
+    positions: Vec<Vec<f64>>,
+    charge: f64,
+    multiplicity: usize,
+    reference: &str,
+    method: &str,
+    field: Option<Vec<f64>>,
+) -> PyResult<PyObject> {
+    let mol = build_molecule(&numbers, &positions, charge, multiplicity)?;
+    let params = Pm3Parameters::standard().map_err(to_py_err)?;
+    let result = run_pm3(
+        &mol,
+        &params,
+        &options_with_field(
+            charge,
+            multiplicity,
+            parse_reference(reference)?,
+            method,
+            field,
+        )?,
+    )
+    .map_err(to_py_err)?;
+    let basis = crate::basis::Basis::build(&mol, &params).map_err(to_py_err)?;
+
+    // Which atom and which function each row of the coefficient matrix is. Without this a
+    // coefficient is a number in an array whose meaning the caller has to reconstruct from the
+    // element table, and getting that wrong is silent.
+    let labels: Vec<(usize, String, &'static str)> = basis
+        .aos
+        .iter()
+        .map(|ao| {
+            let symbol = crate::system::z_to_symbol(ao.z).unwrap_or("X").to_string();
+            // MOPAC's order, which this crate follows: s, px, py, pz, then the five real d.
+            let name = match ao.orb {
+                0 => "s",
+                1 => "px",
+                2 => "py",
+                3 => "pz",
+                4 => "dx2-y2",
+                5 => "dxz",
+                6 => "dz2",
+                7 => "dyz",
+                _ => "dxy",
+            };
+            (ao.atom, symbol, name)
+        })
+        .collect();
+
+    // Columns are MOs, rows are AOs — the convention `Pm3Result::mo_coeff` uses and the one a
+    // reader expects, so `coefficients[i][m]` is AO `i` in MO `m`.
+    let columns = |c: &crate::linalg::Matrix| -> Vec<Vec<f64>> {
+        (0..c.rows)
+            .map(|i| (0..c.cols).map(|j| c[(i, j)]).collect())
+            .collect()
+    };
+    let spectrum = |energies: &[f64], n_occ: usize, occupancy: f64| {
+        let d = PyDict::new(py);
+        let hartree: Vec<f64> = energies.iter().map(|e| e * EV_TO_HARTREE).collect();
+        let occupations: Vec<f64> = (0..energies.len())
+            .map(|i| if i < n_occ { occupancy } else { 0.0 })
+            .collect();
+        (d, hartree, occupations)
+    };
+
+    let d = PyDict::new(py);
+    let restricted = result.mo_coeff_beta.is_none();
+    let occupancy = if restricted { 2.0 } else { 1.0 };
+    let (_, hartree, occupations) = spectrum(&result.mo_energies, result.n_occ, occupancy);
+    d.set_item("mo_energies_ev", result.mo_energies.clone())?;
+    d.set_item("mo_energies_hartree", hartree)?;
+    d.set_item("mo_coefficients", columns(&result.mo_coeff))?;
+    d.set_item("occupations", occupations)?;
+    d.set_item("n_occupied", result.n_occ)?;
+    // `None` rather than an index when a shell is empty or full: there is no frontier orbital
+    // then, and `0` or `nao` would both read as one.
+    d.set_item("homo_index", (result.n_occ > 0).then_some(result.n_occ - 1))?;
+    d.set_item(
+        "lumo_index",
+        (result.n_occ < result.mo_energies.len()).then_some(result.n_occ),
+    )?;
+
+    if let (Some(coefficients), Some(energies)) = (&result.mo_coeff_beta, &result.mo_energies_beta)
+    {
+        let (_, hartree_beta, occupations_beta) = spectrum(energies, result.n_beta, 1.0);
+        d.set_item("mo_energies_beta_ev", energies.clone())?;
+        d.set_item("mo_energies_beta_hartree", hartree_beta)?;
+        d.set_item("mo_coefficients_beta", columns(coefficients))?;
+        d.set_item("occupations_beta", occupations_beta)?;
+    } else {
+        // Present and `None` for a restricted run, so the key set does not depend on the shell.
+        d.set_item("mo_energies_beta_ev", None::<Vec<f64>>)?;
+        d.set_item("mo_energies_beta_hartree", None::<Vec<f64>>)?;
+        d.set_item("mo_coefficients_beta", None::<Vec<Vec<f64>>>)?;
+        d.set_item("occupations_beta", None::<Vec<f64>>)?;
+    }
+    d.set_item("n_beta", result.n_beta)?;
+
+    // The frontier, taken across both spin channels — a radical's β LUMO sits below its α one,
+    // so the α spectrum alone gives the wrong answer. `Pm3Result` already resolves this.
+    d.set_item("homo_ev", result.homo_ev)?;
+    d.set_item("lumo_ev", result.lumo_ev)?;
+    d.set_item(
+        "gap_ev",
+        match (result.homo_ev, result.lumo_ev) {
+            (Some(homo), Some(lumo)) => Some(lumo - homo),
+            _ => None,
+        },
+    )?;
+    d.set_item("ao_labels", labels)?;
+    d.set_item("unrestricted", result.unrestricted)?;
     Ok(d.into())
 }
 
@@ -492,7 +691,7 @@ fn atomic_masses(mol: &crate::system::Molecule, params: &Pm3Parameters) -> PyRes
 
 /// Analytic Cartesian Hessian (Hartree/Bohr²), row-major `3N × 3N`.
 #[pyfunction]
-#[pyo3(signature = (numbers, positions, charge=0.0, multiplicity=1, reference="auto", method="pm3", field=None))]
+#[pyo3(signature = (numbers, positions, charge=0.0, multiplicity=1, reference="auto", method="pm3", field=None, cphf_max_iter=None))]
 #[allow(clippy::too_many_arguments)]
 fn hessian(
     py: Python<'_>,
@@ -503,18 +702,22 @@ fn hessian(
     reference: &str,
     method: &str,
     field: Option<Vec<f64>>,
+    cphf_max_iter: Option<usize>,
 ) -> PyResult<PyObject> {
     let mol = build_molecule(&numbers, &positions, charge, multiplicity)?;
     let params = Pm3Parameters::standard().map_err(to_py_err)?;
     let h = crate::hessian::analytic_hessian(
         &mol,
         &params,
-        &options_with_field(
-            charge,
-            multiplicity,
-            parse_reference(reference)?,
-            parse_variant(method)?,
-            field,
+        &with_cphf_cap(
+            options_with_field(
+                charge,
+                multiplicity,
+                parse_reference(reference)?,
+                method,
+                field,
+            )?,
+            cphf_max_iter,
         )?,
         1.0e-3,
     )
@@ -560,12 +763,7 @@ fn periodic_single_point(
     let mut mol = build_molecule(&numbers, &positions, charge, multiplicity)?;
     attach_cell(&mut mol, Some(cell), pbc)?;
     let params = Pm3Parameters::standard().map_err(to_py_err)?;
-    let options = options(
-        charge,
-        multiplicity,
-        parse_reference(reference)?,
-        parse_variant(method)?,
-    );
+    let options = options(charge, multiplicity, parse_reference(reference)?, method)?;
     let periodic = crate::pbc::gamma::PeriodicOptions::default();
     let spec = parse_kpoints(kpts)?;
 
@@ -604,6 +802,12 @@ fn periodic_single_point(
         // return the same keys.
         d.set_item("entropy_ts_ev", 0.0)?;
         d.set_item("free_energy_ev", r.total_ev)?;
+        // The Γ path has no automatic retry, so this is always `None` there — reported so the
+        // two branches keep the same key set, which is the contract
+        // `tests/test_api_key_contract.py` holds every function to.
+        d.set_item("rescued_by", None::<String>)?;
+        // The Γ loop does not track it; zero rather than absent, so the key set matches.
+        d.set_item("charge_swing", 0.0)?;
         d.set_item("converged", r.converged)?;
         d.set_item("unrestricted", r.unrestricted)?;
         d.set_item("n_kpoints", 1)?;
@@ -629,6 +833,11 @@ fn periodic_single_point(
         d.set_item("fermi_ev", r.fermi_ev)?;
         d.set_item("entropy_ts_ev", r.entropy_ts_ev)?;
         d.set_item("free_energy_ev", r.free_energy_ev)?;
+        // `None` unless the SCF failed at the requested settings and a retry rescued it. A
+        // convergence aid can find a different self-consistent solution, so a result carrying
+        // this is one to corroborate against another mesh rather than to use unread.
+        d.set_item("rescued_by", r.rescued_by.clone())?;
+        d.set_item("charge_swing", r.charge_swing)?;
         // Reported here too, where it is a diagnosis rather than a warning: a negative margin
         // says *why* the mesh was necessary. `KpointResult` has carried it all along.
         d.set_item("gamma_margin_bohr", r.gamma_margin)?;
@@ -665,12 +874,7 @@ fn periodic_forces(
     let mut mol = build_molecule(&numbers, &positions, charge, multiplicity)?;
     attach_cell(&mut mol, Some(cell), pbc)?;
     let params = Pm3Parameters::standard().map_err(to_py_err)?;
-    let options = options(
-        charge,
-        multiplicity,
-        parse_reference(reference)?,
-        parse_variant(method)?,
-    );
+    let options = options(charge, multiplicity, parse_reference(reference)?, method)?;
     let periodic = crate::pbc::gamma::PeriodicOptions::default();
     let spec = parse_kpoints(kpts)?;
     let magnetization = parse_magnetization(magnetization)?;
@@ -783,7 +987,7 @@ fn voigt_ev_per_angstrom3(stress: &crate::math::Mat3) -> Vec<f64> {
 #[pyfunction]
 #[pyo3(signature = (numbers, positions, cell, pbc=None, charge=0.0, multiplicity=1,
                     reference="auto", method="pm3", q=None, kpts=None, smearing_ev=0.0,
-                    lo_to_direction=None))]
+                    lo_to_direction=None, cphf_max_iter=None))]
 #[allow(clippy::too_many_arguments)]
 fn phonons(
     py: Python<'_>,
@@ -799,16 +1003,15 @@ fn phonons(
     kpts: Option<Vec<usize>>,
     smearing_ev: f64,
     lo_to_direction: Option<Vec<f64>>,
+    cphf_max_iter: Option<usize>,
 ) -> PyResult<PyObject> {
     let mut mol = build_molecule(&numbers, &positions, charge, multiplicity)?;
     attach_cell(&mut mol, Some(cell), pbc)?;
     let params = Pm3Parameters::standard().map_err(to_py_err)?;
-    let options = options(
-        charge,
-        multiplicity,
-        parse_reference(reference)?,
-        parse_variant(method)?,
-    );
+    let options = with_cphf_cap(
+        options(charge, multiplicity, parse_reference(reference)?, method)?,
+        cphf_max_iter,
+    )?;
     let periodic = crate::pbc::gamma::PeriodicOptions::default();
     let d = PyDict::new(py);
 
@@ -827,6 +1030,18 @@ fn phonons(
         let result = crate::pbc::hessian::periodic_phonons(&mol, &params, &options, &periodic)
             .map_err(to_py_err)?;
         d.set_item("frequencies_cm", result.frequencies_cm)?;
+        // The polarization vectors, mode-major so `modes[m]` is one mode's displacement pattern.
+        // The Rust matrix is mode-per-*column*; transposing here is what makes the Python side
+        // indexable the way a caller reads it — `modes[m][3 * a + i]`.
+        let modes: Vec<Vec<f64>> = (0..result.modes.cols)
+            .map(|m| {
+                (0..result.modes.rows)
+                    .map(|i| result.modes[(i, m)])
+                    .collect()
+            })
+            .collect();
+        d.set_item("modes", modes)?;
+        d.set_item("masses", result.masses)?;
         d.set_item("acoustic_residual_cm", result.acoustic_residual_cm)?;
         d.set_item("energy_ev", result.scf.total_ev)?;
         return Ok(d.into());
@@ -883,8 +1098,29 @@ fn phonons(
         .map_err(to_py_err)?;
         d.set_item("lo_to_direction", direction)?;
     }
-    let frequencies = crate::pbc::dfpt::frequencies_of(&matrix).map_err(to_py_err)?;
+    let (frequencies, modes) = crate::pbc::dfpt::modes_of(&matrix).map_err(to_py_err)?;
     d.set_item("frequencies_cm", frequencies)?;
+    // Complex at a general `q`: the atoms in a cell move with a relative phase, and throwing the
+    // imaginary part away would silently turn a travelling wave into a standing one. Two real
+    // arrays rather than a Python complex, to match how every other matrix crosses this boundary.
+    let part = |imaginary: bool| -> Vec<Vec<f64>> {
+        (0..modes.cols)
+            .map(|m| {
+                (0..modes.rows)
+                    .map(|i| {
+                        let value = modes[(i, m)];
+                        if imaginary {
+                            value.im
+                        } else {
+                            value.re
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    d.set_item("modes_real", part(false))?;
+    d.set_item("modes_imag", part(true))?;
     d.set_item("masses", matrix.masses.clone())?;
     d.set_item("hermitian_defect", matrix.hermitian_defect)?;
     d.set_item("q", q_frac.to_vec())?;
@@ -918,12 +1154,7 @@ fn bands(
     let mut mol = build_molecule(&numbers, &positions, charge, multiplicity)?;
     attach_cell(&mut mol, Some(cell), pbc)?;
     let params = Pm3Parameters::standard().map_err(to_py_err)?;
-    let options = options(
-        charge,
-        multiplicity,
-        parse_reference(reference)?,
-        parse_variant(method)?,
-    );
+    let options = options(charge, multiplicity, parse_reference(reference)?, method)?;
     // The mesh this path is evaluated in the potential of. It is a self-consistent calculation
     // in its own right, so it needs the same occupation controls the energy does: a band
     // structure of a metal converged under strict filling is a different SCF from the energy the
@@ -992,12 +1223,7 @@ fn relax(
     let mut mol = build_molecule(&numbers, &positions, charge, multiplicity)?;
     attach_cell(&mut mol, Some(cell), pbc)?;
     let params = Pm3Parameters::standard().map_err(to_py_err)?;
-    let options = options(
-        charge,
-        multiplicity,
-        parse_reference(reference)?,
-        parse_variant(method)?,
-    );
+    let options = options(charge, multiplicity, parse_reference(reference)?, method)?;
     // `kpts` is accepted so the signature matches the rest of the periodic surface, and refused
     // rather than ignored: `relax` drives the Γ gradient, so a mesh here would be silently
     // discarded.
@@ -1008,14 +1234,11 @@ fn relax(
     }
     let opt = crate::pbc::optimize::PeriodicOptOptions {
         max_iter: max_steps,
-        // Ångström in, Bohr inside.
-        gtol: force_tol * BOHR_TO_ANGSTROM,
-        // And the same for the stress, which is a *density*: eV/Å³ → eV/Bohr³ is the cube of the
-        // length conversion. This went in raw, so a tolerance documented as eV/Å³ was applied as
-        // eV/Bohr³ — 6.75× looser than asked for — and `converged: True` came back for cells
-        // whose stress had never reached the threshold. The force line one above is what the
-        // missing line should have looked like.
-        stress_tol: stress_tol * BOHR_TO_ANGSTROM * BOHR_TO_ANGSTROM * BOHR_TO_ANGSTROM,
+        // eV/Å in, eV/Bohr inside. The stress line below went in raw once — a tolerance
+        // documented as eV/Å³ applied as eV/Bohr³, 6.75× looser than asked for, `converged: True`
+        // for cells whose stress had never reached the threshold. Both are named functions now.
+        gtol: crate::constants::force_tol_to_au(force_tol),
+        stress_tol: crate::constants::stress_tol_to_au(stress_tol),
         cell: if fixed_cell {
             crate::pbc::optimize::CellRelaxation::Fixed
         } else {
@@ -1044,7 +1267,10 @@ fn relax(
             ]
         })
         .collect();
-    d.set_item("positions", angstrom)?;
+    // Both names, for the reason given in `optimize`: these two functions are the same operation
+    // on different systems and used to disagree about what to call every field they shared.
+    d.set_item("positions", angstrom.clone())?;
+    d.set_item("positions_angstrom", angstrom)?;
     let relaxed = result.molecule.cell.expect("a periodic result has a cell");
     let rows: Vec<Vec<f64>> = relaxed
         .to_rows()
@@ -1053,8 +1279,87 @@ fn relax(
         .collect();
     d.set_item("cell", rows)?;
     d.set_item("energy_ev", result.gradient.energy_ev)?;
+    d.set_item("energy_hartree", result.gradient.energy_ev * EV_TO_HARTREE)?;
+    d.set_item(
+        "heat_of_formation_kcal",
+        result.gradient.scf.heat_of_formation_kcal,
+    )?;
     d.set_item("converged", result.converged)?;
     d.set_item("steps", result.iterations)?;
+    d.set_item("iterations", result.iterations)?;
+    Ok(d.into())
+}
+
+/// A geometry optimization on the divide-and-conquer gradient.
+///
+/// The same L-BFGS as [`optimize`], over the partitioned gradient instead of the full
+/// diagonalization — for the case `divide_and_conquer` exists for, where a full diagonalization
+/// per line-search trial is not affordable.
+#[pyfunction]
+#[pyo3(signature = (numbers, positions, charge=0.0, multiplicity=1, reference="auto",
+                    method="pm3", core_radius=3.2, buffer_radius=4.8, smearing_ev=0.1,
+                    long_range_cutoff=None, field=None, max_steps=200, force_tol=0.02))]
+#[allow(clippy::too_many_arguments)]
+fn divide_and_conquer_optimize(
+    py: Python<'_>,
+    numbers: Vec<u8>,
+    positions: Vec<Vec<f64>>,
+    charge: f64,
+    multiplicity: usize,
+    reference: &str,
+    method: &str,
+    core_radius: f64,
+    buffer_radius: f64,
+    smearing_ev: f64,
+    long_range_cutoff: Option<f64>,
+    field: Option<Vec<f64>>,
+    max_steps: usize,
+    force_tol: f64,
+) -> PyResult<PyObject> {
+    let mol = build_molecule(&numbers, &positions, charge, multiplicity)?;
+    let params = Pm3Parameters::standard().map_err(to_py_err)?;
+    let options = options_with_field(
+        charge,
+        multiplicity,
+        parse_reference(reference)?,
+        method,
+        field,
+    )?;
+    let dc = crate::dc::DcOptions {
+        core_radius: core_radius * ANGSTROM_TO_BOHR,
+        buffer_radius: buffer_radius * ANGSTROM_TO_BOHR,
+        smearing_ev,
+        long_range_cutoff: long_range_cutoff.map(|r| r * ANGSTROM_TO_BOHR),
+        ..crate::dc::DcOptions::default()
+    };
+    let opt = crate::OptOptions {
+        max_iter: max_steps,
+        gtol: crate::constants::force_tol_to_au(force_tol),
+        ..crate::OptOptions::default()
+    };
+    let result =
+        crate::optimizer::optimize_dc(&mol, &params, &options, &dc, &opt).map_err(to_py_err)?;
+
+    let coords: Vec<Vec<f64>> = result
+        .molecule
+        .atoms
+        .iter()
+        .map(|a| {
+            let p = a.position * BOHR_TO_ANGSTROM;
+            vec![p.x, p.y, p.z]
+        })
+        .collect();
+    let d = PyDict::new(py);
+    // The same names `optimize` and `relax` use, for the reason given there.
+    d.set_item("positions_angstrom", coords.clone())?;
+    d.set_item("positions", coords)?;
+    d.set_item("energy_ev", result.scf.total_ev)?;
+    d.set_item("energy_hartree", result.scf.total_ev * EV_TO_HARTREE)?;
+    d.set_item("heat_of_formation_kcal", result.scf.heat_of_formation_kcal)?;
+    d.set_item("converged", result.converged)?;
+    d.set_item("iterations", result.iterations)?;
+    d.set_item("steps", result.iterations)?;
+    d.set_item("n_subsystems", result.scf.n_subsystems)?;
     Ok(d.into())
 }
 
@@ -1104,7 +1409,7 @@ fn divide_and_conquer(
         charge,
         multiplicity,
         parse_reference(reference)?,
-        parse_variant(method)?,
+        method,
         field,
     )?;
     // `run_dc_gamma` does not read `long_range_cutoff` — the screening split belongs to the
@@ -1203,7 +1508,7 @@ fn divide_and_conquer_forces(
         charge,
         multiplicity,
         parse_reference(reference)?,
-        parse_variant(method)?,
+        method,
         field,
     )?;
     if periodic_run && long_range_cutoff.is_some() {
@@ -1303,12 +1608,7 @@ fn berry_polarization(
     let mut mol = build_molecule(&numbers, &positions, charge, multiplicity)?;
     attach_cell(&mut mol, Some(cell), pbc)?;
     let params = Pm3Parameters::standard().map_err(to_py_err)?;
-    let opts = options(
-        charge,
-        multiplicity,
-        parse_reference(reference)?,
-        parse_variant(method)?,
-    );
+    let opts = options(charge, multiplicity, parse_reference(reference)?, method)?;
     let periodic = crate::pbc::gamma::PeriodicOptions::default();
     let kopt = match kpts {
         Some(divisions) => {
@@ -1387,12 +1687,7 @@ fn phonon_bands(
         ));
     }
     let params = Pm3Parameters::standard().map_err(to_py_err)?;
-    let opts = options(
-        charge,
-        multiplicity,
-        parse_reference(reference)?,
-        parse_variant(method)?,
-    );
+    let opts = options(charge, multiplicity, parse_reference(reference)?, method)?;
     let periodic = crate::pbc::gamma::PeriodicOptions::default();
     let mut constants = crate::ForceConstants::from_supercell(
         &mol,
@@ -1469,12 +1764,7 @@ fn finite_field(
         return Err(PyValueError::new_err("kpts takes three divisions"));
     }
     let params = Pm3Parameters::standard().map_err(to_py_err)?;
-    let opts = options(
-        charge,
-        multiplicity,
-        parse_reference(reference)?,
-        parse_variant(method)?,
-    );
+    let opts = options(charge, multiplicity, parse_reference(reference)?, method)?;
     let periodic = crate::pbc::gamma::PeriodicOptions::default();
     let ff = crate::pbc::finite_field::FiniteFieldOptions {
         tol,
@@ -1494,7 +1784,12 @@ fn finite_field(
 
     let vector = |v: crate::Vec3| vec![v.x, v.y, v.z];
     let d = PyDict::new(py);
+    // `energy` is this function's own name for the converged total and is kept; `energy_ev` is
+    // what the other twenty-one native functions call the same quantity, and its absence here
+    // was one more way to end a calculation with a `KeyError`. Both, and the unit is in the name
+    // of the one a caller reaching across functions will reach for.
     d.set_item("energy", result.scf.total_ev)?;
+    d.set_item("energy_ev", result.scf.total_ev)?;
     d.set_item("enthalpy_ev", result.enthalpy_ev)?;
     d.set_item("polarization", vector(result.polarization))?;
     d.set_item(
@@ -1526,7 +1821,7 @@ fn finite_field(
 /// would hide exactly that. Pass `enforce=True` to have the mean violation removed afterwards.
 #[pyfunction]
 #[pyo3(signature = (numbers, positions, cell, pbc=None, charge=0.0, multiplicity=1,
-                    reference="auto", method="pm3", enforce=false))]
+                    reference="auto", method="pm3", enforce=false, cphf_max_iter=None))]
 #[allow(clippy::too_many_arguments)]
 fn born_charges(
     py: Python<'_>,
@@ -1539,16 +1834,15 @@ fn born_charges(
     reference: &str,
     method: &str,
     enforce: bool,
+    cphf_max_iter: Option<usize>,
 ) -> PyResult<PyObject> {
     let mut mol = build_molecule(&numbers, &positions, charge, multiplicity)?;
     attach_cell(&mut mol, Some(cell), pbc)?;
     let params = Pm3Parameters::standard().map_err(to_py_err)?;
-    let opts = options(
-        charge,
-        multiplicity,
-        parse_reference(reference)?,
-        parse_variant(method)?,
-    );
+    let opts = with_cphf_cap(
+        options(charge, multiplicity, parse_reference(reference)?, method)?,
+        cphf_max_iter,
+    )?;
     let periodic = crate::pbc::gamma::PeriodicOptions::default();
     let mut born =
         crate::pbc::born::born_charges(&mol, &params, &opts, &periodic).map_err(to_py_err)?;
@@ -1602,7 +1896,7 @@ fn gamma_margin(mol: &Molecule, periodic: &crate::pbc::gamma::PeriodicOptions) -
 /// minimum and the ionic term is missing whatever those modes would have contributed.
 #[pyfunction]
 #[pyo3(signature = (numbers, positions, cell, pbc=None, charge=0.0, multiplicity=1,
-                    reference="auto", method="pm3", include_ionic=false))]
+                    reference="auto", method="pm3", include_ionic=false, cphf_max_iter=None))]
 #[allow(clippy::too_many_arguments)]
 fn dielectric(
     py: Python<'_>,
@@ -1615,16 +1909,15 @@ fn dielectric(
     reference: &str,
     method: &str,
     include_ionic: bool,
+    cphf_max_iter: Option<usize>,
 ) -> PyResult<PyObject> {
     let mut mol = build_molecule(&numbers, &positions, charge, multiplicity)?;
     attach_cell(&mut mol, Some(cell), pbc)?;
     let params = Pm3Parameters::standard().map_err(to_py_err)?;
-    let opts = options(
-        charge,
-        multiplicity,
-        parse_reference(reference)?,
-        parse_variant(method)?,
-    );
+    let opts = with_cphf_cap(
+        options(charge, multiplicity, parse_reference(reference)?, method)?,
+        cphf_max_iter,
+    )?;
     let periodic = crate::pbc::gamma::PeriodicOptions::default();
     let alpha = crate::pbc::dielectric::polarizability(&mol, &params, &opts, &periodic)
         .map_err(to_py_err)?;
@@ -1663,7 +1956,7 @@ fn dielectric(
 /// isotope substitution or a different projection reuses it without solving the response again.
 #[pyfunction]
 #[pyo3(signature = (numbers, positions, charge=0.0, multiplicity=1, reference="auto",
-                    method="pm3", field=None))]
+                    method="pm3", field=None, cphf_max_iter=None))]
 #[allow(clippy::too_many_arguments)]
 fn ir_spectrum(
     py: Python<'_>,
@@ -1674,15 +1967,19 @@ fn ir_spectrum(
     reference: &str,
     method: &str,
     field: Option<Vec<f64>>,
+    cphf_max_iter: Option<usize>,
 ) -> PyResult<PyObject> {
     let mol = build_molecule(&numbers, &positions, charge, multiplicity)?;
     let params = Pm3Parameters::standard().map_err(to_py_err)?;
-    let opts = options_with_field(
-        charge,
-        multiplicity,
-        parse_reference(reference)?,
-        parse_variant(method)?,
-        field,
+    let opts = with_cphf_cap(
+        options_with_field(
+            charge,
+            multiplicity,
+            parse_reference(reference)?,
+            method,
+            field,
+        )?,
+        cphf_max_iter,
     )?;
     let s = crate::ir::ir_spectrum(&mol, &params, &opts, 1.0e-3).map_err(to_py_err)?;
 
@@ -1736,7 +2033,7 @@ fn dipole(
         charge,
         multiplicity,
         parse_reference(reference)?,
-        parse_variant(method)?,
+        method,
         field,
     )?;
     let scf = run_pm3(&mol, &params, &opts).map_err(to_py_err)?;
@@ -1819,12 +2116,7 @@ fn dynamical_matrix(
     let mut mol = build_molecule(&numbers, &positions, charge, multiplicity)?;
     attach_cell(&mut mol, Some(cell), pbc)?;
     let params = Pm3Parameters::standard().map_err(to_py_err)?;
-    let opts = options(
-        charge,
-        multiplicity,
-        parse_reference(reference)?,
-        parse_variant(method)?,
-    );
+    let opts = options(charge, multiplicity, parse_reference(reference)?, method)?;
     if q.len() != 3 {
         return Err(PyValueError::new_err(
             "q must have three fractional components, one per reciprocal lattice vector",
@@ -1881,7 +2173,7 @@ fn dynamical_matrix(
 /// has no single set of molecular orbitals to write.
 #[pyfunction]
 #[pyo3(signature = (numbers, positions, charge=0.0, multiplicity=1, reference="auto",
-                    method="pm3", field=None))]
+                    method="pm3", field=None, basis="gto"))]
 #[allow(clippy::too_many_arguments)]
 fn molden(
     numbers: Vec<u8>,
@@ -1891,7 +2183,18 @@ fn molden(
     reference: &str,
     method: &str,
     field: Option<Vec<f64>>,
+    basis: &str,
 ) -> PyResult<String> {
+    let form = match basis.to_ascii_lowercase().as_str() {
+        "gto" => crate::molden::MoldenBasis::Gto,
+        "sto" => crate::molden::MoldenBasis::Sto,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown molden basis {other:?}: use \"gto\" (the default, and what viewers \
+                 read) or \"sto\" (the Slater exponents PM3 actually uses)"
+            )))
+        }
+    };
     let mol = build_molecule(&numbers, &positions, charge, multiplicity)?;
     let params = Pm3Parameters::standard().map_err(to_py_err)?;
     let result = run_pm3(
@@ -1901,12 +2204,12 @@ fn molden(
             charge,
             multiplicity,
             parse_reference(reference)?,
-            parse_variant(method)?,
+            method,
             field,
         )?,
     )
     .map_err(to_py_err)?;
-    crate::molden::molden_string(&mol, &params, &result).map_err(to_py_err)
+    crate::molden::molden_string_with(&mol, &params, &result, form).map_err(to_py_err)
 }
 
 /// Run the `pm3-rs` command line, returning its exit code.
@@ -1926,6 +2229,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(forces, m)?)?;
     m.add_function(wrap_pyfunction!(optimize, m)?)?;
     m.add_function(wrap_pyfunction!(frequencies, m)?)?;
+    m.add_function(wrap_pyfunction!(orbitals, m)?)?;
     m.add_function(wrap_pyfunction!(hessian, m)?)?;
     m.add_function(wrap_pyfunction!(periodic_single_point, m)?)?;
     m.add_function(wrap_pyfunction!(periodic_forces, m)?)?;
@@ -1935,6 +2239,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dipole, m)?)?;
     m.add_function(wrap_pyfunction!(dynamical_matrix, m)?)?;
     m.add_function(wrap_pyfunction!(divide_and_conquer, m)?)?;
+    m.add_function(wrap_pyfunction!(divide_and_conquer_optimize, m)?)?;
     m.add_function(wrap_pyfunction!(divide_and_conquer_forces, m)?)?;
     m.add_function(wrap_pyfunction!(born_charges, m)?)?;
     m.add_function(wrap_pyfunction!(dielectric, m)?)?;

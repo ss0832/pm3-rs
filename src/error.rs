@@ -35,6 +35,14 @@ pub enum Pm3Error {
     ScfNotConverged {
         iterations: usize,
         error: f64,
+        /// What the iteration was actually doing when it ran out, when the loop can tell.
+        ///
+        /// "did not converge (error=3.7e-5)" says a calculation failed and nothing about what to
+        /// do next, and the three ways a periodic SCF fails want three different remedies —
+        /// charge sloshing wants preconditioning, band crossing wants smearing, and a slow tail
+        /// just wants iterations. The k-point loop measures which one it is and says so; paths
+        /// that do not yet distinguish them leave this `None` rather than guess.
+        diagnosis: Option<String>,
     },
 }
 
@@ -58,10 +66,20 @@ impl fmt::Display for Pm3Error {
                 f,
                 "{operation} requires approximately {required_mb} MiB, exceeding the configured {limit_mb} MiB workspace limit"
             ),
-            Self::ScfNotConverged { iterations, error } => write!(
-                f,
-                "PM3 SCF did not converge after {iterations} iterations (error={error:.3e})"
-            ),
+            Self::ScfNotConverged {
+                iterations,
+                error,
+                diagnosis,
+            } => {
+                write!(
+                    f,
+                    "PM3 SCF did not converge after {iterations} iterations (error={error:.3e})"
+                )?;
+                match diagnosis {
+                    Some(text) => write!(f, ". {text}"),
+                    None => Ok(()),
+                }
+            }
         }
     }
 }

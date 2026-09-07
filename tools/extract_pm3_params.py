@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Extract PM3 parameters from the MOPAC v23.2.5 Fortran sources."""
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Extract PM3 parameters from the MOPAC v23.2.5 Fortran sources.
+
+This script is the boundary the parameter tables cross: its inputs are Apache-2.0 MOPAC
+Fortran (never redistributed here -- see third_party/mopac/NOTICE) and its outputs are the
+CSVs under src/data/ that ship compiled into the library. The script itself is original
+GPL-3.0-or-later code; what it carries across is numeric scientific parameter values, with
+the provenance recorded in the CSV headers it writes.
+"""
 
 from __future__ import annotations
 

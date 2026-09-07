@@ -553,6 +553,7 @@ where
         return Err(Pm3Error::ScfNotConverged {
             iterations,
             error: f64::NAN,
+            diagnosis: None,
         });
     }
 

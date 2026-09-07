@@ -51,6 +51,7 @@ pub mod overlap_numeric;
 pub mod params;
 pub mod pbc;
 pub mod repulsion;
+pub mod rigid;
 pub mod rotations;
 pub mod scf;
 pub mod special;
@@ -75,7 +76,7 @@ pub use linalg::Matrix;
 pub use math::{Mat3, Vec3};
 pub use molden::molden_string;
 pub use neighbor::{NeighborList, PairImage};
-pub use optimizer::{optimize, OptOptions, OptResult};
+pub use optimizer::{optimize, optimize_dc, DcOptResult, OptOptions, OptResult};
 pub use params::{PairParams, Pm3Element, Pm3Parameters, SparkleElement};
 pub use pbc::berry::{berry_polarization, BerryPolarization};
 pub use pbc::born::{born_charge_sum_rule_residual, born_charges, enforce_born_sum_rule};
@@ -84,9 +85,11 @@ pub use pbc::dfpt::{
     frequencies_of, phonon_frequencies, phonon_frequencies_on_mesh, rigid_ion_dynamical_matrix,
     DfptOptions, DfptResult, DynamicalMatrix, LongRange,
 };
+#[allow(deprecated)]
+pub use pbc::dielectric::SOFT_MODE_FLOOR;
 pub use pbc::dielectric::{
     dielectric_origin_sensitivity, dielectric_tensor, polarizability, static_dielectric_tensor,
-    DielectricTensors, StaticDielectric, SOFT_MODE_FLOOR,
+    DielectricTensors, StaticDielectric,
 };
 pub use pbc::ewald::{ewald, ChargeSite, EwaldOutput, EwaldParams};
 pub use pbc::ewald_hessian::ewald_atom_hessian;

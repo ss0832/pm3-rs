@@ -6,7 +6,7 @@
 //!
 //! Nothing about the *integrals* changes at finite `k`. The geometry setup — the screened
 //! two-electron tables, the Ewald sum, the core–core energy, the classical corrections — is the
-//! same [`crate::pbc::gamma::build_setup`] the Γ path uses, and it is shared rather than
+//! same `pbc::gamma::build_setup` the Γ path uses, and it is shared rather than
 //! reimplemented.
 //!
 //! What changes is which density multiplies what. In direct space
@@ -29,7 +29,7 @@
 //! exactly as at Γ.
 //!
 //! Only the **resonance** `β·S` and the **exchange** connect orbitals in different cells, and only
-//! those two are therefore carried image by image, in [`crate::pbc::gamma::ImageBlock`]. So the
+//! those two are therefore carried image by image, in `pbc::gamma::ImageBlock`. So the
 //! Bloch sum is short: `F(k) = F_onsite + Σ_T e^{ik·T} [β·S(T) − K(T)]`.
 //!
 //! # No generalized eigenproblem
@@ -138,6 +138,32 @@ pub struct KpointResult {
     /// translational contribution anywhere in this crate. `smearing_ev` is `k_B T` for a
     /// fictitious electronic temperature chosen to make a metal's occupations converge, not for
     /// the temperature of an experiment.
+    /// The largest swing any atom's electron population made **during** the iteration, in
+    /// electrons.
+    ///
+    /// Zero for a well-behaved SCF, which walks downhill. A large value means the density passed
+    /// through qualitatively different arrangements on its way — charge sloshing — and a
+    /// converged result that got there by sloshing is one that may have settled on a spurious
+    /// self-consistent branch rather than the intended one. Rocksalt NaCl on a `2×2×2` mesh
+    /// swings **1.1 electrons** and converges to a state with `−4.94` electrons on the *sodium*,
+    /// against `+0.17` on every odd mesh: converged, self-consistent, and chemical nonsense.
+    ///
+    /// Reported rather than judged, because the crate has no way to know what is physical for a
+    /// given system, and a threshold here would be a chemistry opinion in a numerics library.
+    /// What it can say is that the iteration did not go straight there.
+    pub charge_swing: f64,
+    /// Non-`None` if the SCF failed at the requested settings and a retry rescued it, naming what
+    /// the retry changed.
+    ///
+    /// **Read this before trusting a result that carries it.** A convergence aid can land on a
+    /// *different* self-consistent solution rather than on the one that was asked for, and the
+    /// difference is not always small: rocksalt NaCl on a `2×2×2` mesh converges by itself to
+    /// `−341.79 eV` and, with a 5 eV level shift, to `−379.22`. The retry uses a level shift
+    /// precisely because it leaves the converged density alone where it works — diamond and
+    /// silicon come out at the same energy that damping reaches — but "where it works" is a
+    /// statement about the run, not a guarantee. Confirm a rescued answer against a different
+    /// mesh before building on it.
+    pub rescued_by: Option<String>,
     pub entropy_ts_ev: f64,
     /// The **Mermin electronic free energy** per cell (eV): `total_ev − entropy_ts_ev`.
     ///
@@ -177,7 +203,86 @@ pub struct KpointResult {
     /// The converged direct-space density, kept so [`band_structure`] can diagonalize at points
     /// that were never part of the mesh. Not public: it is an internal representation, and the
     /// physically meaningful part of it is already exposed as [`KpointResult::density`].
-    converged_density: (DensitySet, DensitySet),
+    ///
+    /// `pub(crate)` rather than private because the phonon skeleton needs `P(T)`, not just
+    /// `P(0)`. It assembled meshed dynamical matrices out of `P(0)` alone for every image, which
+    /// is the Γ identity `P(T) = P(0)` — true by construction at Γ and false on a mesh, and the
+    /// cause of a meshed `D(0)` that broke cubic symmetry and missed a finite difference by 300%.
+    pub(crate) converged_density: (DensitySet, DensitySet),
+}
+
+impl KpointResult {
+    /// `P(T)` for one atom pair and lattice translation, `norb_a × norb_b` row-major.
+    ///
+    /// `None` when the pair is outside the image list the SCF was built with, which means the
+    /// block is zero by construction rather than missing.
+    ///
+    /// The orientation is the one asked for: an image list holds each pair once, so a request for
+    /// `(b, a, −T)` is served by transposing the stored `(a, b, T)`.
+    pub(crate) fn density_image(
+        &self,
+        images: &[crate::pbc::gamma::ImageBlock],
+        a: usize,
+        b: usize,
+        t: [i32; 3],
+    ) -> Option<ImagePair<'_>> {
+        let (alpha, beta) = &self.converged_density;
+        let negated = [-t[0], -t[1], -t[2]];
+        for (index, block) in images.iter().enumerate() {
+            if block.a == a && block.b == b && block.t == t {
+                return Some(ImagePair {
+                    alpha: &alpha.images[index],
+                    beta: &beta.images[index],
+                    cols: block.norb_b,
+                    transposed: false,
+                });
+            }
+            if block.a == b && block.b == a && block.t == negated {
+                return Some(ImagePair {
+                    alpha: &alpha.images[index],
+                    beta: &beta.images[index],
+                    cols: block.norb_b,
+                    transposed: true,
+                });
+            }
+        }
+        None
+    }
+}
+
+/// One image block of the density, in the orientation the caller asked for.
+pub(crate) struct ImagePair<'a> {
+    alpha: &'a [f64],
+    beta: &'a [f64],
+    /// Row stride **as stored**, before any transposition.
+    cols: usize,
+    transposed: bool,
+}
+
+impl ImagePair<'_> {
+    /// `P^α(T)[mu, nu] + P^β(T)[mu, nu]` in the requested orientation.
+    pub(crate) fn total(&self, mu: usize, nu: usize) -> f64 {
+        let index = if self.transposed {
+            nu * self.cols + mu
+        } else {
+            mu * self.cols + nu
+        };
+        self.alpha[index] + self.beta[index]
+    }
+
+    /// The same element for one spin channel: `0` is α, anything else β.
+    pub(crate) fn spin(&self, channel: usize, mu: usize, nu: usize) -> f64 {
+        let index = if self.transposed {
+            nu * self.cols + mu
+        } else {
+            mu * self.cols + nu
+        };
+        if channel == 0 {
+            self.alpha[index]
+        } else {
+            self.beta[index]
+        }
+    }
 }
 
 /// Band energies along a path through the Brillouin zone.
@@ -343,6 +448,37 @@ pub fn band_structure(
 }
 
 /// Run a k-point periodic PM3 calculation.
+/// Smearing for the retry, in eV. Only ever accepted when it turns out to have changed
+/// nothing — see the note at the call site.
+/// The mixing fraction the first rescue rung uses.
+///
+/// 0.9 rather than the 0.3–0.5 a textbook fallback recommends, because the failures this path
+/// actually sees are not the gentle ones that fraction is for. Measured: silicon needs 0.9 and is
+/// unrescued at 0.5; NaCl converges unaided; diamond is unrescued at any fraction because its
+/// residual alternates rather than decays.
+const RESCUE_DAMPING: f64 = 0.9;
+
+const RESCUE_SMEARING_EV: f64 = 0.1;
+
+/// Iteration budget for a retry.
+///
+/// A rescued iteration is slower as well as more stable, and the default 200 is the budget that
+/// already failed. Diamond under a level shift is still coming down at iteration 2000.
+const RESCUE_ITERATIONS: usize = 2000;
+
+/// `T·S` below which the occupations are integral and smearing changed nothing.
+///
+/// Fermi–Dirac at 0.1 eV puts `f` within `1e-9` of 0 or 1 for any state more than 2 eV from the
+/// chemical potential, so a gapped insulator lands far below this and a system with any state
+/// near the Fermi level lands far above. There is no continuum in between at this smearing.
+///
+/// `pub(crate)` because the response uses the same certificate for a different decision: this
+/// path asks whether a smearing rescue changed the answer, and `pbc::dfpt` asks whether the
+/// occupations are integral enough for a response that is not a metallic DFPT to be valid. One
+/// threshold for one question — "is any state fractionally filled" — rather than two that could
+/// drift apart.
+pub(crate) const INTEGRAL_OCCUPATION_ENTROPY_EV: f64 = 1.0e-6;
+
 pub fn run_kpoints(
     molecule: &Molecule,
     params: &Pm3Parameters,
@@ -350,7 +486,134 @@ pub fn run_kpoints(
     periodic: &PeriodicOptions,
     kopt: &KpointOptions,
 ) -> Result<KpointResult> {
-    run_kpoints_with_terms(molecule, params, options, periodic, kopt, None)
+    let first = run_kpoints_with_terms(molecule, params, options, periodic, kopt, None);
+    let (iterations, error, diagnosis) = match first {
+        Ok(result) => return Ok(result),
+        Err(Pm3Error::ScfNotConverged {
+            iterations,
+            error,
+            diagnosis,
+        }) => (iterations, error, diagnosis),
+        // Anything else is not a convergence failure and retrying it would only take longer to
+        // report the same thing.
+        Err(other) => return Err(other),
+    };
+
+    // One retry, with a level shift, and only if the caller had not already set one — otherwise
+    // this would silently override a deliberate choice.
+    //
+    // A level shift and not smearing, though smearing is the faster rescue on the same ladder.
+    // Smearing changes the state: silicon converges under `0.1 eV` to an energy `0.69 eV` away
+    // from the one damping and the shift agree on, and NaCl under `0.5 eV` to one `37 eV` away.
+    // A rescue that answers a different question is worse than a failure, because the failure is
+    // visible.
+    let asked_for_aid =
+        options.level_shift_ev != 0.0 || kopt.smearing_ev != 0.0 || options.damping != 0.0;
+    let give_up = || Pm3Error::ScfNotConverged {
+        iterations,
+        error,
+        diagnosis: diagnosis.clone(),
+    };
+    if asked_for_aid {
+        return Err(give_up());
+    }
+
+    let budget = options.max_scf.max(RESCUE_ITERATIONS);
+
+    // **Rung one: damping.** Ordered first because its guarantee is the stronger of the two.
+    //
+    // Damping changes the *path* and not the equations: the density fed to the next Fock is
+    // `(1−λ)P_new + λP_old`, and at a fixed point those coincide, so a converged damped run
+    // satisfies exactly the equations that were asked for. Nothing has to be certified after the
+    // fact the way smearing does.
+    //
+    // The one thing that could have made this dishonest is already ruled out by construction: the
+    // convergence test above measures `fresh − p`, the **undamped** step, so damping cannot
+    // flatter it. Had it measured the damped step, a `λ = 0.9` run would report a residual five
+    // times smaller than the truth and "converged" would mean a fifth of what it says.
+    //
+    // Measured on `examples/scf_hardening.rs`: damping at 0.9 rescues silicon and does nothing
+    // for diamond, whose residual sits in an alternating limit cycle on two density elements
+    // rather than decaying — a symmetry-breaking oscillation that no mixing fraction reaches.
+    let damped = Pm3Options {
+        damping: RESCUE_DAMPING,
+        max_scf: budget,
+        ..options.clone()
+    };
+    if let Ok(mut rescued) = run_kpoints_with_terms(molecule, params, &damped, periodic, kopt, None)
+    {
+        rescued.rescued_by = Some(format!(
+            "the SCF ran out at the requested settings (residual {error:.3e} after {iterations} \
+             iterations) and converged with density damping of {RESCUE_DAMPING} over {budget} \
+             iterations. Damping changes the path and not the fixed point, and the convergence \
+             test measures the undamped step, so this solves the equations that were asked for. \
+             It does not guarantee the same *basin*: a cell with more than one self-consistent \
+             solution can be steered between them by the mixer, and NaCl on an even mesh has \
+             three that differ by tens of eV. Compare against a different mesh before trusting a \
+             rescued energy"
+        ));
+        return Ok(rescued);
+    }
+
+    // **Fermi smearing, accepted only when it provably changed nothing.**
+    //
+    // This is the one convergence aid with a certificate, and the certificate is why it is the
+    // only one applied automatically. If the occupations come out integral then `T·S` is zero, no
+    // state is fractionally filled, and the smeared fixed-point equations are *identical* to the
+    // strict-filling ones -- smearing only changed how the chemical potential was found on the
+    // way to them. So the answer is the one that was asked for, not a nearby one.
+    //
+    // The alternative aids were measured on the same three systems
+    // (`examples/scf_hardening.rs`) and none of them can say that. A 5 eV level shift converges
+    // diamond to `−248.64 eV` where smearing gives `−249.27`; diamond's gap is 15.9 eV, so
+    // smearing cannot have moved an occupation and the shift is the one that found a different
+    // solution. Damping to 0.9 rescues silicon and does nothing for diamond. An *unguarded*
+    // smearing is worse still: it takes silicon 0.69 eV away from the right answer and NaCl 37 eV
+    // away, because there the occupations really do go fractional.
+    //
+    // So: rung two, with a proof, and nothing after it. A level shift is *not* a third rung —
+    // it converges diamond to a different solution, which is the one failure mode worse than not
+    // converging. It stays in the diagnosis for the caller to choose deliberately.
+    let smeared = KpointOptions {
+        smearing_ev: RESCUE_SMEARING_EV,
+        ..kopt.clone()
+    };
+    let longer = Pm3Options {
+        max_scf: budget,
+        ..options.clone()
+    };
+    if let Ok(mut rescued) =
+        run_kpoints_with_terms(molecule, params, &longer, periodic, &smeared, None)
+    {
+        if rescued.entropy_ts_ev.abs() <= INTEGRAL_OCCUPATION_ENTROPY_EV {
+            rescued.rescued_by = Some(format!(
+                "the SCF ran out at the requested settings (residual {error:.3e} after \
+                 {iterations} iterations) and converged with {RESCUE_SMEARING_EV} eV of Fermi \
+                 smearing over {budget} iterations. The occupations came out integral -- the \
+                 electronic entropy is {:.2e} eV -- so this is the same self-consistent state \
+                 the request asked for, reached by a smoother path to the chemical potential",
+                rescued.entropy_ts_ev
+            ));
+            return Ok(rescued);
+        }
+        // Fractional occupations: a real answer, but to a different question. Say so rather than
+        // return it, and rather than say nothing.
+        return Err(Pm3Error::ScfNotConverged {
+            iterations,
+            error,
+            diagnosis: Some(format!(
+                "{}. A retry with {RESCUE_SMEARING_EV} eV of smearing does converge, but to a \
+                 state with fractional occupations (electronic entropy {:.3e} eV), which is a \
+                 different calculation rather than the same one reached more carefully -- so it \
+                 is reported rather than returned. Set KpointOptions::smearing_ev yourself if \
+                 that is what you want, and compare two smearings before trusting it",
+                diagnosis.unwrap_or_else(|| "the iteration ran out".to_string()),
+                rescued.entropy_ts_ev
+            )),
+        });
+    }
+
+    Err(give_up())
 }
 
 /// The same, with an extra Hermitian term added to `H(k)` at each k-point.
@@ -475,8 +738,11 @@ pub(crate) fn run_kpoints_with_terms(
         },
         iterations: state.iterations,
         converged: state.converged,
+        charge_swing: state.charge_swing,
         gamma_margin: setup.gamma_margin,
         converged_density: state.converged_density,
+        // Set by `run_kpoints` if it had to retry; the inner routine never rescues itself.
+        rescued_by: None,
     })
 }
 
@@ -635,6 +901,8 @@ struct KScfState {
     electron_ewald_ev: f64,
     iterations: usize,
     converged: bool,
+    /// Largest per-atom population swing over the whole run; see KpointResult::charge_swing.
+    charge_swing: f64,
     converged_density: (DensitySet, DensitySet),
 }
 
@@ -719,6 +987,13 @@ fn scf_loop(
     let mut bands_beta = vec![Vec::new(); n_k];
     let mut occupations = vec![Vec::new(); n_k];
     let mut occupations_beta = vec![Vec::new(); n_k];
+    // Last iteration's filling, so the trace can say whether states are changing sides.
+    let mut previous_occupations: Vec<Vec<f64>> = vec![Vec::new(); n_k];
+    // `(per-atom population, occupation flips, residual)` for the last few iterations, which is
+    // what [`diagnose`] reads if this loop runs out.
+    let mut recent: Vec<(Vec<f64>, usize, f64)> = Vec::with_capacity(DIAGNOSIS_WINDOW + 1);
+    // `(min, max)` population per atom over the whole run, for `KpointResult::charge_swing`.
+    let mut population_range: Vec<(f64, f64)> = Vec::new();
     let mut fermi_ev = 0.0;
     let mut fermi_beta_ev = 0.0;
     let mut history = DensityDiis::new(
@@ -866,6 +1141,90 @@ fn scf_loop(
             .rms_difference(&p_alpha.onsite)
             .max(fresh_beta.onsite.rms_difference(&p_beta.onsite));
 
+        // `PM3_KSCF_WHERE=1`: which element of the density is still moving, and how the on-site
+        // block compares with the images. A residual that will not go below `1e-4` on a
+        // wide-gap insulator is not what a Pulay iteration is supposed to do, and the first
+        // question is which part of the density it lives in.
+        if std::env::var_os("PM3_KSCF_WHERE").is_some() {
+            let n = fresh_alpha.onsite.rows;
+            let mut worst = (0.0_f64, 0usize, 0usize);
+            for i in 0..n {
+                for j in 0..n {
+                    let d = (fresh_alpha.onsite[(i, j)] - p_alpha.onsite[(i, j)]).abs();
+                    if d > worst.0 {
+                        worst = (d, i, j);
+                    }
+                }
+            }
+            let image_worst = fresh_alpha
+                .images
+                .iter()
+                .zip(&p_alpha.images)
+                .flat_map(|(a, b)| a.iter().zip(b).map(|(x, y)| (x - y).abs()))
+                .fold(0.0_f64, f64::max);
+            eprintln!(
+                "  where {iterations:4}  onsite max |dP| {:.3e} at ({}, {})  images max |dP| {:.3e}",
+                worst.0, worst.1, worst.2, image_worst
+            );
+        }
+
+        // Constant damping, all the way to the end — deliberately, and it is worth recording why,
+        // because the alternative looks obviously right and is not.
+        //
+        // The Γ path hands over: `gamma.rs` disables damping as soon as its accelerator engages.
+        // This path does not, and that costs something measurable. Diamond on a `3×3×3` mesh
+        // reaches a residual of `1.1e-4` in a dozen iterations and then crawls, losing only a
+        // factor of three over the next 190 against a `1e-7` tolerance, with DIIS extrapolating
+        // on every one of them; mixing at `0.3` forever shrinks each residual by the same factor
+        // before DIIS sees it, so the history spans less and less of the error.
+        //
+        // Handing over here — on the residual alone, or on the residual *and* the accelerator
+        // having worked — converges diamond and silicon and breaks four k-point identities that
+        // do not otherwise fail: the supercell folding, the band path against the mesh, the
+        // folded forces, and an open-shell mesh's magnetization. Those are the tests that say
+        // this path computes what it claims to, so the trade is not available at that price.
+        //
+        // Three literature remedies were implemented and measured against this. None of them is
+        // an improvement, and the measurements are worth more than another attempt:
+        //
+        // * **Deeper Pulay history** (Pulay, *Chem. Phys. Lett.* **73**, 393 (1980)). `MAX_DEPTH`
+        //   8 → 24 moves diamond's residual from `3.72e-5` to `3.41e-5`. Depth is not the binding
+        //   constraint, so the stall is not the history failing to span the slow modes.
+        //
+        // * **Kerker preconditioning** (Kerker, *Phys. Rev. B* **23**, 3082 (1981); the local-basis
+        //   transcription is the atomic-charge channel, as in DFTB+). Mixing the monopole channel
+        //   at a quarter strength is neutral on every odd mesh, as designed — diamond does not
+        //   move an electron between atoms at any point — and on NaCl's `2×2×2` it makes the
+        //   sloshing **worse**, 1.44 electrons of swing becoming 2.56.
+        //
+        // * **Handing damping over to the accelerator**, as the Γ path does — see above.
+        //
+        // The Kerker result is the informative one, because it says what NaCl's `2×2×2` failure
+        // actually is. Three different mixers reach three different *converged* solutions on the
+        // same cell and mesh — `−341.79`, `−366.34` and `−379.22 eV`, with `−2.10`, `−4.35` and
+        // `−4.94` electrons of charge on the sodium — while every mesh from `3³` to `7³` agrees on
+        // `−327.45` and `+0.17`. That is not an ill-conditioned iteration that a preconditioner
+        // straightens out. The fixed-point map has several attractors at that sampling and the
+        // mixer picks among them; the cure is not to use that mesh, and `charge_swing` is here so
+        // that using it is visible.
+        //
+        // `PM3_KSCF_WHERE=1` says where the residual that will not go away actually lives, and on
+        // diamond the answer is specific: elements `(2, 7)` and `(3, 6)` of the on-site block,
+        // pinned at `9.3e-5` for the last hundred iterations and **alternating between the two**.
+        // With four orbitals per atom those are atom 1's `p_y` against atom 2's `p_z` and its
+        // mirror — two elements a symmetry operation exchanges. The iteration is not converging
+        // slowly towards a fixed point; it is orbiting between two symmetry-equivalent bond-order
+        // arrangements, and their average is not a fixed point either, which is why a Pulay
+        // history of any depth extrapolates onto it and leaves again.
+        //
+        // That is a symmetry-breaking limit cycle, and mixing is the wrong tool for it. The
+        // remedy in codes that have it is to symmetrize the density against the crystal's point
+        // group each pass (VASP's `ISYM`, and the equivalent elsewhere), which needs symmetry
+        // detection this crate does not have. It is worth knowing that the missing piece is
+        // symmetry rather than a better mixer.
+        //
+        // The diagnosis below reports the stiff tail meanwhile, with the iteration count it would
+        // need, so a caller can raise `max_scf` knowingly.
         damp_set(&mut p_alpha, &fresh_alpha, damping);
         damp_set(&mut p_beta, &fresh_beta, damping);
 
@@ -877,17 +1236,96 @@ fn scf_loop(
         // few flat vectors rather than a Fock matrix per k-point.
         let residual = difference(&fresh_alpha, &fresh_beta, &p_alpha, &p_beta);
         history.push(flatten(&p_alpha, &p_beta), residual);
-        if let Some(blended) = history.extrapolate() {
-            unflatten(&blended, &mut p_alpha, &mut p_beta);
-        }
+        let extrapolated = match history.extrapolate() {
+            Some(blended) => {
+                unflatten(&blended, &mut p_alpha, &mut p_beta);
+                true
+            }
+            // The solve refused every suffix. Plain damping then, which converges but slowly, and
+            // the trace says so rather than leaving a 0.99-per-step tail unexplained.
+            None => false,
+        };
 
+        // Two failure modes look identical in `dP` alone and want opposite remedies, so the trace
+        // separates them:
+        //
+        // * **Charge sloshing** — a long-wavelength density mode the iteration keeps
+        //   overshooting. Its signature is the per-atom electron population swinging while the
+        //   *energy* barely moves, because moving charge between well-separated sites costs
+        //   little. Damping and DIIS fight it; preconditioning is what cures it.
+        // * **Band crossing** — states reordering across the Fermi level, so the occupation
+        //   assignment flips between iterations. Its signature is `flips`: how many states
+        //   changed occupation by more than a thousandth of an electron since the last pass. A
+        //   non-zero steady value means the iteration is choosing a different filling each time
+        //   and cannot converge by damping at all.
+        //
+        // Set `PM3_KSCF_TRACE=1`.
         if std::env::var_os("PM3_KSCF_TRACE").is_some() {
+            let population: Vec<f64> = (0..setup.basis.atom_offset.len())
+                .map(|atom| {
+                    let off = setup.basis.atom_offset[atom];
+                    (0..setup.basis.atom_norb[atom])
+                        .map(|mu| fresh_alpha.onsite[(off + mu, off + mu)])
+                        .sum::<f64>()
+                })
+                .collect();
+            let flips = occupations
+                .iter()
+                .zip(previous_occupations.iter())
+                .map(|(now, before)| {
+                    now.iter()
+                        .zip(before.iter())
+                        .filter(|(a, b)| (*a - *b).abs() > 1.0e-3)
+                        .count()
+                })
+                .sum::<usize>();
+            let charges: Vec<String> = population.iter().map(|v| format!("{v:7.4}")).collect();
             eprintln!(
                 "  k-scf {iterations:4}  E={electronic:16.6}  dE={:12.3e}  dP={change:10.3e}  \
-                 mu={fermi_ev:9.4}",
-                electronic - last_energy
+                 mu={fermi_ev:9.4}  flips={flips:3}  diis={}{:<2}  n_e=[{}]",
+                electronic - last_energy,
+                if extrapolated { "y" } else { "N" },
+                history.len(),
+                charges.join(" ")
             );
         }
+        // The history the failure diagnosis reads. A fixed, small window: what matters is what
+        // the iteration was doing when it ran out, not what it did on its way there.
+        {
+            let population: Vec<f64> = (0..setup.basis.atom_offset.len())
+                .map(|atom| {
+                    let off = setup.basis.atom_offset[atom];
+                    (0..setup.basis.atom_norb[atom])
+                        .map(|mu| fresh_alpha.onsite[(off + mu, off + mu)])
+                        .sum::<f64>()
+                })
+                .collect();
+            let flips = occupations
+                .iter()
+                .zip(previous_occupations.iter())
+                .map(|(now, before)| {
+                    now.iter()
+                        .zip(before.iter())
+                        .filter(|(a, b)| (*a - *b).abs() > 1.0e-3)
+                        .count()
+                })
+                .sum::<usize>();
+            // The whole-run extremes, not just the window's: sloshing that happened early and
+            // damped out is still what decided which branch the iteration ended on.
+            if population_range.is_empty() {
+                population_range = population.iter().map(|p| (*p, *p)).collect();
+            } else {
+                for (slot, value) in population_range.iter_mut().zip(&population) {
+                    slot.0 = slot.0.min(*value);
+                    slot.1 = slot.1.max(*value);
+                }
+            }
+            recent.push((population, flips, change));
+            if recent.len() > DIAGNOSIS_WINDOW {
+                recent.remove(0);
+            }
+        }
+        previous_occupations.clone_from(&occupations);
         last_change = change;
         if (electronic - last_energy).abs() < options.e_tol && change < options.p_tol {
             converged = true;
@@ -902,6 +1340,7 @@ fn scf_loop(
         return Err(Pm3Error::ScfNotConverged {
             iterations,
             error: last_change,
+            diagnosis: Some(diagnose(&recent, options.p_tol, options.max_scf)),
         });
     }
 
@@ -927,6 +1366,10 @@ fn scf_loop(
         electron_ewald_ev,
         iterations,
         converged,
+        charge_swing: population_range
+            .iter()
+            .map(|(lo, hi)| hi - lo)
+            .fold(0.0_f64, f64::max),
         converged_density: (p_alpha, p_beta),
     })
 }
@@ -1384,6 +1827,112 @@ fn difference(
     let old = flatten(alpha, beta);
     out.iter().zip(&old).map(|(a, b)| a - b).collect()
 }
+
+/// How many iterations the failure diagnosis looks back over.
+///
+/// Long enough to see a limit cycle — the NaCl one has a period of a few steps — and short enough
+/// that it describes where the iteration ended up rather than where it started.
+const DIAGNOSIS_WINDOW: usize = 12;
+
+/// Say what the iteration was doing when it ran out.
+///
+/// The three ways a periodic SCF fails look identical in the residual and want different
+/// remedies, so reporting the residual alone tells a caller a calculation failed and nothing
+/// about what to change. All three are distinguishable from what the loop already computes:
+///
+/// * **Charge sloshing** — the per-atom populations swing while nothing else settles. Measured on
+///   rocksalt NaCl with a `2×2×2` mesh: a full **1.1 electrons** moving between Na and Cl every
+///   iteration, with the chemical potential following it across twelve electronvolts. Damping and
+///   DIIS fight this and do not win, because the mode is nearly free in energy.
+/// * **Band crossing** — states change occupation between passes, so the iteration is solving a
+///   different filling each time. Smearing is what makes that continuous.
+/// * **A slow tail** — nothing oscillates and the residual falls, just not fast enough. Diamond
+///   and silicon on a `3×3×3` mesh do this at about `0.993` per iteration. The remedy is
+///   iterations, and the estimate below says how many.
+///
+/// The classification is measured per run, not assumed from the system: `docs/pbc.md` attributed
+/// NaCl's failure to a Fermi level trapped in a degenerate manifold, and the flip count says the
+/// occupations never change at all.
+fn diagnose(recent: &[(Vec<f64>, usize, f64)], p_tol: f64, max_scf: usize) -> String {
+    if recent.len() < 3 {
+        return "too few iterations to say why".to_string();
+    }
+    let flips: usize = recent.iter().map(|(_, f, _)| *f).sum();
+    let swing = {
+        let atoms = recent[0].0.len();
+        (0..atoms)
+            .map(|atom| {
+                let values: Vec<f64> = recent.iter().map(|(p, _, _)| p[atom]).collect();
+                let hi = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let lo = values.iter().cloned().fold(f64::INFINITY, f64::min);
+                hi - lo
+            })
+            .fold(0.0_f64, f64::max)
+    };
+    let residuals: Vec<f64> = recent.iter().map(|(_, _, r)| *r).collect();
+    let first = residuals[0];
+    let last = *residuals.last().unwrap();
+    // Geometric mean of the per-step ratio: below 1 the residual is still coming down.
+    let rate = if first > 0.0 && last > 0.0 {
+        (last / first).powf(1.0 / (residuals.len() - 1) as f64)
+    } else {
+        1.0
+    };
+
+    // A tenth of an electron moving back and forth is not rounding; it is the mode. Below that,
+    // whatever is left is not what is holding the calculation up.
+    if swing > 0.1 {
+        return format!(
+            "charge is sloshing: an atom's population swung by {swing:.3} electrons over the last \
+             {} iterations while the density never settled. That is a long-wavelength mode the \
+             iteration keeps overshooting, and it is nearly free in energy, so damping and DIIS \
+             do not catch it. An odd k-mesh usually avoids it where an even one does not (see \
+             docs/pbc.md); failing that, a larger supercell at Γ",
+            recent.len()
+        );
+    }
+    if flips > 0 {
+        return format!(
+            "states are changing occupation: {flips} occupation changes over the last {} \
+             iterations, so the filling itself is different each pass and no amount of damping \
+             the density can settle it. Set KpointOptions::smearing_ev, which makes the \
+             occupation a continuous function of the band energy — and compare the energy against \
+             a smaller smearing, since a large one converges to a different state",
+            recent.len()
+        );
+    }
+    if rate < 1.0 && last > 0.0 {
+        // How many more steps at this rate, if it holds.
+        let needed = (p_tol / last).ln() / rate.ln();
+        if needed.is_finite() && needed > 0.0 {
+            return format!(
+                "nothing is oscillating and the residual is still falling, at {rate:.4} per \
+                 iteration — a stiff iteration rather than an unstable one. At that rate it needs \
+                 roughly {} more to reach the tolerance; raise Pm3Options::max_scf above the \
+                 current {max_scf}. {}",
+                needed.ceil() as u64,
+                UNVERIFIABLE_AIDS
+            );
+        }
+    }
+    format!(
+        "the residual is flat at {last:.3e} with no charge oscillation and no occupation changes, \
+         so more iterations at these settings will not help. {UNVERIFIABLE_AIDS}"
+    )
+}
+
+/// The aids that work but cannot certify themselves, offered rather than applied.
+///
+/// [`run_kpoints`] retries only with smearing, and only keeps the result when the occupations
+/// come out integral — a check that proves the answer is the one that was asked for. Damping and
+/// a level shift have no equivalent certificate: on the measured ladder a 5 eV shift converges
+/// diamond to an energy 0.63 eV from the one smearing reaches, on a crystal whose 15.9 eV gap
+/// means smearing cannot have moved an occupation. Both are worth trying by hand, with the
+/// comparison this sentence asks for.
+const UNVERIFIABLE_AIDS: &str = "Pm3Options::damping near 0.9 and \
+     Pm3Options::level_shift_ev near 5.0 each converge cases this does not, but neither can show \
+     it found the same solution rather than another one -- so compare the energy against a \
+     different k-mesh, or against the other aid, before relying on it";
 
 fn damp_set(current: &mut DensitySet, fresh: &DensitySet, damping: f64) {
     for (slot, value) in current

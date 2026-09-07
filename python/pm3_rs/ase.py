@@ -27,7 +27,11 @@ from __future__ import annotations
 import numpy as np
 
 try:
-    from ase.calculators.calculator import Calculator, all_changes
+    from ase.calculators.calculator import (
+        Calculator,
+        PropertyNotImplementedError,
+        all_changes,
+    )
     from ase.units import Bohr, Hartree
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
@@ -382,6 +386,27 @@ class PM3(Calculator):
         """Cartesian energy gradient in **eV/A** (the negative of forces)."""
         return -self.get_forces(atoms)
 
+    def get_dipole_moment(self, atoms=None):
+        """Dipole moment in **e.A**, molecular only.
+
+        A periodic dipole is not defined without a surface convention -- the answer
+        depends on where the cell is cut -- so this refuses rather than reporting the
+        cell's own charge-times-position sum, which looks usable and is not. Use
+        :meth:`get_berry_polarization` for the periodic quantity that *is* defined,
+        or :meth:`get_born_charges` for its derivative.
+
+        ASE's own refusal for an unset property names the property and nothing else;
+        this one says why.
+        """
+        target = self._bound(atoms if atoms is not None else self.atoms)
+        if self._is_periodic(target):
+            raise PropertyNotImplementedError(
+                "a dipole is not defined for a periodic cell without a surface convention; "
+                "use get_berry_polarization() for the polarization, or get_born_charges() "
+                "for its derivative with respect to displacement."
+            )
+        return self.get_property("dipole", atoms)
+
     def get_stress(self, atoms=None):
         """Stress in **eV/A^3** as ASE's 6-component Voigt vector.
 
@@ -393,13 +418,26 @@ class PM3(Calculator):
         """
         return self.get_property("stress", atoms)
 
-    def get_phonons(self, atoms=None, q=None, kpts=None, lo_to_direction=None):
-        """Phonon frequencies in **cm^-1**.
+    def get_phonons(
+        self, atoms=None, q=None, kpts=None, lo_to_direction=None, cphf_max_iter=None
+    ):
+        """Phonon frequencies in **cm^-1**, with their polarization vectors.
 
         With ``q`` left out this is the Gamma-point analytic Hessian, and the
         result carries ``acoustic_residual_cm`` -- the largest of the three
         acoustic frequencies, which should vanish and is reported so it can be
         checked rather than trusted.
+
+        **Eigenvectors** come back alongside the frequencies. At Gamma they are
+        ``modes``, real, one mode per row: ``modes[m][3 * a + i]`` is the
+        mass-weighted displacement of atom ``a`` along axis ``i``, so the
+        Cartesian displacement is that over ``sqrt(masses[a])``. At a wavevector
+        they are complex and arrive as ``modes_real`` and ``modes_imag``, because
+        the atoms in a cell move with a relative phase and discarding it would
+        turn a travelling wave into a standing one.
+
+        ``cphf_max_iter`` raises the coupled-perturbed iteration cap for the
+        response behind the calculation; ``None`` keeps the default of 400.
 
         ``q`` is a fractional wavevector, one component per reciprocal lattice
         vector, and switches to density-functional perturbation theory: the
@@ -426,6 +464,9 @@ class PM3(Calculator):
             None
             if lo_to_direction is None
             else tuple(float(v) for v in np.asarray(lo_to_direction).reshape(-1)),
+            # In the key because it decides whether the response converged at all: without it, a
+            # generous first call would serve its answer to a later, stricter one.
+            cphf_max_iter,
         )
         return self._memo(
             "phonons",
@@ -443,6 +484,7 @@ class PM3(Calculator):
                 q=q,
                 kpts=mesh,
                 lo_to_direction=lo_to_direction,
+                cphf_max_iter=cphf_max_iter,
             ),
         )
 
@@ -484,6 +526,11 @@ class PM3(Calculator):
         ASE's own optimizers move the atoms in a fixed cell through
         ``get_forces``; this is the direct route, and the only one here that
         relaxes the lattice.
+
+        The returned dict carries ``positions``/``positions_angstrom``, ``cell``,
+        ``energy_ev``/``energy_hartree``, ``heat_of_formation_kcal``, ``converged``
+        and ``steps``/``iterations`` -- the same names :func:`pm3_rs.native.optimize`
+        uses for a molecule.
         """
         atoms = self._bound(atoms if atoms is not None else self.atoms)
         if not self._is_periodic(atoms):
@@ -567,6 +614,51 @@ class PM3(Calculator):
             smearing_ev=smearing_ev,
             long_range_cutoff=long_range_cutoff,
             field=self.field,
+        )
+        return dict(result)
+
+    def divide_and_conquer_optimize(self, atoms=None, core_radius=3.2, buffer_radius=4.8,
+                                    smearing_ev=0.1, long_range_cutoff=None, max_steps=200,
+                                    force_tol=0.02):
+        """Relax a molecule on the partitioned gradient.
+
+        The arguments are :meth:`divide_and_conquer`'s, plus ``max_steps`` and
+        ``force_tol`` (eV/A) from :meth:`relax`. Returns the relaxed
+        ``positions``/``positions_angstrom`` in Angstrom rather than mutating
+        ``atoms``, alongside ``energy_ev``/``energy_hartree``,
+        ``heat_of_formation_kcal``, ``converged``, ``steps``/``iterations`` and
+        ``n_subsystems`` -- the same names :meth:`relax` and
+        :func:`pm3_rs.native.optimize` use.
+
+        Molecular only, because the partitioned path has no cell gradient: a
+        periodic structure would have to be relaxed at fixed cell without saying
+        so, and :meth:`relax` is the periodic optimizer.
+
+        The geometry this reaches is the buffer's minimum, not the method's --
+        the partitioned gradient is not the exact derivative of the partitioned
+        energy. Widen ``buffer_radius`` and re-run before believing a structure.
+        """
+        atoms = self._bound(atoms if atoms is not None else self.atoms)
+        if self._is_periodic(atoms):
+            raise RuntimeError(
+                "divide_and_conquer_optimize is molecular: the partitioned path has no cell "
+                "gradient, so a periodic structure would be relaxed at fixed cell without "
+                "saying so. Use relax() for a periodic structure."
+            )
+        result = native.divide_and_conquer_optimize(
+            atoms.get_atomic_numbers(),
+            atoms.get_positions(),
+            charge=self.charge,
+            multiplicity=self.multiplicity,
+            reference=self.reference,
+            method=self.method,
+            core_radius=core_radius,
+            buffer_radius=buffer_radius,
+            smearing_ev=smearing_ev,
+            long_range_cutoff=long_range_cutoff,
+            field=self.field,
+            max_steps=max_steps,
+            force_tol=force_tol,
         )
         return dict(result)
 
@@ -902,7 +994,7 @@ class PM3(Calculator):
             np.asarray(result["imag"], dtype=float),
         )
 
-    def write_molden(self, path, atoms=None):
+    def write_molden(self, path, atoms=None, basis="gto"):
         """Write the converged wavefunction to ``path`` as a Molden file.
 
         Not an ASE property -- ASE has no notion of one -- so this recomputes the
@@ -910,6 +1002,11 @@ class PM3(Calculator):
 
         Molecular only. A periodic wavefunction has no single set of molecular
         orbitals to write.
+
+        ``basis`` is ``"gto"`` (the default, an even-tempered Gaussian expansion
+        of the Slater orbitals, which is what viewers read) or ``"sto"`` (the
+        exponents PM3 actually uses, for viewers that read ``[STO]``). Only the
+        basis section differs; the orbitals are the same wavefunction.
 
         The calculator's ``field`` is applied, as it is by every sibling
         accessor. Omitting it wrote the field-free wavefunction to a file
@@ -930,6 +1027,7 @@ class PM3(Calculator):
             reference=self.reference,
             method=self.method,
             field=self.field,
+            basis=basis,
         )
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(text)

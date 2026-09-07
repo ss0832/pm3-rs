@@ -133,9 +133,15 @@ class TestPeriodicNative:
         r = pm3_rs.phonons(WATER["numbers"], WATER["positions"], EDGE_ANGSTROM)
         frequencies = np.asarray(r["frequencies_cm"])
         assert frequencies.shape == (9,)
+        # Exactly three zeros: the acoustic branch is projected out of the mass-weighted matrix,
+        # so it is empty rather than small. Only translations -- a crystal is not invariant under
+        # rotating its contents inside a fixed lattice, so the librations are left alone.
+        assert int(np.sum(frequencies == 0.0)) == 3, frequencies
         # The three internal modes of water survive whatever the cell does.
         assert np.sort(np.abs(frequencies))[-3:].min() > 1000.0
-        assert r["acoustic_residual_cm"] < 20.0
+        # Now the *pre*-projection residual, so it measures the lattice sums rather than restating
+        # what the projection did. Reading it off the projected spectrum could only return zero.
+        assert 0.0 < r["acoustic_residual_cm"] < 20.0, r["acoustic_residual_cm"]
 
 
 class TestDivideAndConquer:

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Generate a roughly spherical water cluster of N molecules on a jittered lattice."""
 import math, sys, random
 

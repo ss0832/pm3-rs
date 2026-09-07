@@ -60,6 +60,11 @@ impl DensityDiis {
         }
     }
 
+    /// How many vectors the history is holding, which is the depth the next extrapolation gets.
+    pub fn len(&self) -> usize {
+        self.density.len()
+    }
+
     pub fn push(&mut self, density: Vec<f64>, residual: Vec<f64>) {
         let row: Vec<f64> = self
             .residual

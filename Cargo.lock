@@ -653,7 +653,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pm3-rs"
-version = "0.2.3"
+version = "0.2.5"
 dependencies = [
  "faer",
  "pyo3",

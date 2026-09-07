@@ -71,13 +71,37 @@ pub struct PeriodicPhonons {
     /// The converged SCF the Hessian was evaluated at.
     pub scf: PeriodicResult,
     /// `∂²E/∂R∂R` per cell (eV/Bohr²) — the dynamical matrix at `q = 0`, before mass weighting.
+    ///
+    /// The **raw** second derivative, symmetric, with nothing imposed on it. The acoustic
+    /// projection that produces the frequencies below is applied to a mass-weighted copy and
+    /// never to this.
     pub hessian: Matrix,
     /// Γ-point phonon frequencies (cm⁻¹), ascending. Negative values denote imaginary modes.
+    ///
+    /// The three acoustic modes are **exactly** `0.0`: the translations are projected out of the
+    /// mass-weighted matrix before it is diagonalized, so those directions are empty rather than
+    /// small. Nothing is selected by being below a threshold.
     pub frequencies_cm: Vec<f64>,
     /// Eigenvalues of the mass-weighted matrix, in the same order.
     pub eigenvalues: Vec<f64>,
-    /// The three smallest `|ω|`, which are the acoustic modes and should be zero. Reported so a
-    /// caller can see how well that came out instead of having to trust it.
+    /// The **mass-weighted** eigenvectors, one mode per column, in the same order.
+    ///
+    /// Column `m` is the displacement pattern of mode `m` in mass-weighted coordinates, so the
+    /// Cartesian displacement of atom `a` is its three rows divided by `sqrt(mass[a])` — the same
+    /// convention as [`crate::VibrationalModes::modes`], and [`PeriodicPhonons::masses`] is what
+    /// de-weights it.
+    ///
+    /// A frequency says how fast the crystal vibrates; this says how. Without it there is no way
+    /// to tell an optical branch from an acoustic one, or to see which sublattice a soft mode
+    /// moves — and it was being computed and discarded.
+    pub modes: Matrix,
+    /// Atomic masses (amu) in the molecule's atom order, for de-weighting [`Self::modes`].
+    pub masses: Vec<f64>,
+    /// The largest acoustic `|ω|` **before** the acoustic branch was projected out.
+    ///
+    /// Zero in exact arithmetic, so this measures how well the lattice sums cancelled — the same
+    /// diagnostic `rigid_residual_cm` is for a molecule. Through 0.2.3 it was the third smallest
+    /// `|ω|` of the *corrected* spectrum, which is the number the correction had just flattened.
     pub acoustic_residual_cm: f64,
 }
 
@@ -100,18 +124,26 @@ pub fn periodic_phonons(
     periodic: &PeriodicOptions,
 ) -> Result<PeriodicPhonons> {
     let scf = run_gamma(molecule, params, options, periodic)?;
-    let mut hessian = hessian_at(molecule, params, options, periodic, &scf)?;
-    enforce_acoustic_sum_rule(&mut hessian);
-    let (frequencies_cm, eigenvalues) = frequencies(molecule, params, &hessian)?;
-    let mut acoustic: Vec<f64> = frequencies_cm.iter().map(|f| f.abs()).collect();
-    acoustic.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let acoustic_residual_cm = acoustic.get(2).copied().unwrap_or(0.0);
+    // The Hessian is handed to `frequencies` by reference and comes back untouched: the acoustic
+    // branch is projected out of the mass-weighted copy inside, so what is stored below is the
+    // raw second derivative.
+    //
+    // It used to be `enforce_acoustic_sum_rule(&mut hessian)` here, which had two problems. The
+    // row-wise correction is not symmetric -- it subtracts a per-row share from column entries
+    // only -- so the stored `hessian` came back non-symmetric, and `symmetric_eigen` reads one
+    // triangle and silently re-symmetrizes, which partly undid the sum rule that had just been
+    // imposed. And the residual was then read off the *corrected* spectrum, so it reported the
+    // number the correction had just flattened rather than the one worth seeing.
+    let hessian = hessian_at(molecule, params, options, periodic, &scf)?;
+    let solved = frequencies(molecule, params, &hessian)?;
     Ok(PeriodicPhonons {
         scf,
         hessian,
-        frequencies_cm,
-        eigenvalues,
-        acoustic_residual_cm,
+        frequencies_cm: solved.frequencies_cm,
+        eigenvalues: solved.eigenvalues,
+        modes: solved.modes,
+        masses: solved.masses,
+        acoustic_residual_cm: solved.acoustic_residual_cm,
     })
 }
 
@@ -133,7 +165,22 @@ fn hessian_at(
     let ndof = 3 * nat;
     let basis = Basis::build(molecule, params)?;
 
+    // Where a Γ-point Hessian's time goes. Same discipline as `PM3_GAMMA_PROFILE`: the Ewald
+    // finding in this release came from measuring rather than reading, after three plausible
+    // guesses had each changed the wall clock by nothing. Set `PM3_HESSIAN_PROFILE=1`.
+    let profile = std::env::var_os("PM3_HESSIAN_PROFILE").is_some();
+    let clock = std::time::Instant::now();
+    let mut mark = 0.0f64;
+    let lap = |name: &str, clock: &std::time::Instant, mark: &mut f64| {
+        if profile {
+            let now = clock.elapsed().as_secs_f64();
+            eprintln!("[hessian profile] {name:<14} {:>8.2} s", now - *mark);
+            *mark = now;
+        }
+    };
+
     let mut hessian = skeleton(molecule, params, options, periodic, scf, &basis)?;
+    lap("skeleton", &clock, &mut mark);
 
     // The lattice sum's own second derivative, at fixed charges.
     let cell = molecule.cell.expect("run_gamma requires a cell");
@@ -166,7 +213,17 @@ fn hessian_at(
     }
 
     // The density's response.
-    response(molecule, params, periodic, scf, &basis, &mut hessian)?;
+    lap("ewald + corr", &clock, &mut mark);
+    response(
+        molecule,
+        params,
+        options,
+        periodic,
+        scf,
+        &basis,
+        &mut hessian,
+    )?;
+    lap("response", &clock, &mut mark);
 
     // Average away the asymmetry that different summation orders leave behind.
     for i in 0..ndof {
@@ -236,6 +293,9 @@ pub(crate) fn skeleton(
                 pair.b,
                 pair.dvec,
                 pair.r,
+                // A Γ-point Hessian, where `P(T) = P(0)` is the sampling rather than an
+                // approximation on top of it.
+                None,
             )
         })
         .collect();
@@ -270,6 +330,15 @@ pub(crate) fn pair_block(
     b: usize,
     dvec_in: Vec3,
     r: f64,
+    // `P(T)` for **this** image's `(a, b)` block, oriented as the `a` and `b` arguments are.
+    //
+    // `None` means "use `density`'s own `(a, b)` block", which asserts `P(T) = P(0)`. That is
+    // exactly true at Γ — one k-point cannot distinguish images — and false on a k-mesh, where
+    // `P(0)` is the Brillouin-zone average and `P(T)` decays with `T`. Passing `None` from a
+    // meshed ground state is what made a meshed `D(0)` anisotropic on a cubic crystal and put it
+    // 300% away from a finite difference; the on-site blocks below are `P(0)` either way and are
+    // untouched by this.
+    image: Option<&crate::pbc::kscf::ImagePair<'_>>,
 ) -> Result<PairBlock> {
     use crate::pbc::gradient::resonance_beta;
 
@@ -305,6 +374,34 @@ pub(crate) fn pair_block(
     // cannot get the bookkeeping wrong.
     let mut energy = Dual2::constant(0.0);
 
+    // The off-diagonal `(first, second)` density element, from `P(T)` where there is one.
+    //
+    // `pair_block` reorders its two atoms so the heavier basis comes first, and `image` is
+    // oriented as the caller's `(a, b)` — so when the swap happened the indices swap with it.
+    let off_diagonal_total = |mu: usize, la: usize| -> f64 {
+        match image {
+            None => density[(off_first + mu, off_second + la)],
+            Some(p) if heavy_first => p.total(mu, la),
+            Some(p) => p.total(la, mu),
+        }
+    };
+    // The same element for one exchange channel. `exchange` is `[(P, ½)]` for a closed shell and
+    // `[(P^α, 1), (P^β, 1)]` for an open one — the same two shapes `ImagePair` distinguishes, so
+    // a single channel reads the total and two read the spins in order.
+    let off_diagonal_exchange = |channel: usize, spin: &Matrix, mu: usize, la: usize| -> f64 {
+        match image {
+            None => spin[(off_first + mu, off_second + la)],
+            Some(p) => {
+                let (i, j) = if heavy_first { (mu, la) } else { (la, mu) };
+                if exchange.len() == 1 {
+                    p.total(i, j)
+                } else {
+                    p.spin(channel, i, j)
+                }
+            }
+        }
+    };
+
     for mu in 0..na {
         for nu in 0..na {
             let coefficient = density[(off_first + mu, off_first + nu)];
@@ -326,7 +423,7 @@ pub(crate) fn pair_block(
             let bi = resonance_beta(first, basis.aos[off_first + mu].orb);
             for la in 0..nb.min(4) {
                 let bj = resonance_beta(second, basis.aos[off_second + la].orb);
-                let coefficient = density[(off_first + mu, off_second + la)] * (bi + bj);
+                let coefficient = off_diagonal_total(mu, la) * (bi + bj);
                 energy = energy + overlap[mu][la] * coefficient;
             }
         }
@@ -343,10 +440,10 @@ pub(crate) fn pair_block(
                     energy = energy + (te.w[index] - point.w[index]) * switch * weight;
                     if inside_short_range {
                         let mut weight = 0.0;
-                        for (spin, scale) in exchange {
+                        for (channel, (spin, scale)) in exchange.iter().enumerate() {
                             weight -= scale
-                                * spin[(off_first + mu, off_second + la)]
-                                * spin[(off_first + nu, off_second + si)];
+                                * off_diagonal_exchange(channel, spin, mu, la)
+                                * off_diagonal_exchange(channel, spin, nu, si);
                         }
                         energy = energy + te.w[index] * weight;
                     }
@@ -510,31 +607,71 @@ pub(crate) fn charge_sites(
     Ok((sites, ewald_params))
 }
 
-/// Zero the residual net force on the whole cell, row by row.
+/// Zero the residual net force on the whole cell, by projecting the three uniform translations
+/// out of the Cartesian Hessian.
 ///
 /// Every term in the Hessian is a function of interatomic displacements, so each row-block already
 /// sums to zero up to rounding. This removes that rounding, which matters because the acoustic
 /// frequencies come out as the square root of nearly-cancelling numbers.
+///
+/// [`periodic_phonons`] no longer calls this — it projects the mass-weighted copy instead and
+/// leaves the Hessian it returns raw. This stays for a caller assembling force constants of its
+/// own.
+///
+/// **Both sides, not one.** The row-wise version this replaces subtracted a per-row share from
+/// column entries only, which left a symmetric matrix asymmetric by `c[j][β_i] − c[i][β_j]`. That
+/// matters more than the size of the violation suggests: [`crate::linalg::symmetric_eigen`] reads
+/// only the lower triangle, so the matrix actually diagonalized was `tril(H) + tril(H)ᵀ`, which
+/// does not satisfy the sum rule that had just been imposed on it. The correction was undone, in
+/// part, by the very step it existed to serve.
 pub fn enforce_acoustic_sum_rule(hessian: &mut Matrix) {
-    let ndof = hessian.rows;
-    let nat = ndof / 3;
-    for row in 0..ndof {
-        for beta in 0..3 {
-            let total: f64 = (0..nat).map(|atom| hessian[(row, 3 * atom + beta)]).sum();
-            let share = total / nat as f64;
-            for atom in 0..nat {
-                hessian[(row, 3 * atom + beta)] -= share;
-            }
-        }
+    let nat = hessian.rows / 3;
+    if nat == 0 {
+        return;
     }
+    // Unweighted translations: a Cartesian Hessian's null vectors are uniform displacements, so
+    // every site carries the same amplitude here rather than `√m`.
+    let positions = vec![crate::math::Vec3::new(0.0, 0.0, 0.0); nat];
+    let unit = vec![1.0; nat];
+    let basis = crate::rigid::rigid_body_basis(
+        &positions,
+        &unit,
+        crate::rigid::RigidMotions::TranslationsOnly,
+    );
+    crate::rigid::project_out_symmetric(&basis, hessian);
 }
 
-/// Mass-weight and diagonalize, returning frequencies in cm⁻¹ (negative = imaginary).
+/// Mass-weight and diagonalize, returning frequencies in cm⁻¹ (negative = imaginary), the
+/// eigenvalues, and the largest acoustic wavenumber found **before** the acoustic branch was
+/// projected out.
+///
+/// The three translations are removed by projection here, on the mass-weighted copy, exactly as
+/// [`crate::hessian::vibrational_analysis`] does for a molecule. Only translations: a crystal is
+/// not invariant under rotating its contents inside a fixed lattice, so the rotational generators
+/// are not null vectors of this matrix and projecting them out would delete real restoring force.
+///
+/// The caller's Hessian is **not** modified. That is the point of doing it here rather than to
+/// the matrix itself: `PeriodicPhonons::hessian` and `periodic_hessian` hand back the raw second
+/// derivative, which is what anyone doing their own analysis needs.
+/// What diagonalizing the mass-weighted Γ-point matrix produces.
+///
+/// `modes` are the **mass-weighted** eigenvectors, one per column, in the same order as the
+/// frequencies. They used to be computed and dropped on the floor here, which left a Γ-point
+/// phonon calculation able to say how fast the crystal vibrates and not how — and the "how" is
+/// what tells an optical mode from an acoustic one, or says which sublattice a soft mode moves.
+struct Diagonalized {
+    frequencies_cm: Vec<f64>,
+    eigenvalues: Vec<f64>,
+    modes: Matrix,
+    masses: Vec<f64>,
+    acoustic_residual_cm: f64,
+}
+
 fn frequencies(
     molecule: &Molecule,
     params: &Pm3Parameters,
     hessian: &Matrix,
-) -> Result<(Vec<f64>, Vec<f64>)> {
+) -> Result<Diagonalized> {
     let nat = molecule.atoms.len();
     let ndof = 3 * nat;
     let mut masses = Vec::with_capacity(nat);
@@ -555,25 +692,45 @@ fn frequencies(
             };
         }
     }
-    let (eigenvalues, _) = symmetric_eigen(&weighted)?;
+
+    let positions: Vec<crate::math::Vec3> = molecule.atoms.iter().map(|a| a.position).collect();
+    let acoustic = crate::rigid::rigid_body_basis(
+        &positions,
+        &masses,
+        crate::rigid::RigidMotions::TranslationsOnly,
+    );
+    // What the acoustic branch carried before it was removed. This is what
+    // `acoustic_residual_cm` now reports: a measurement of the lattice sums' quality, taken
+    // before the projection rather than after it. Reading it off the projected spectrum, as it
+    // used to be, reported the number the projection had just set to zero.
+    let residual_cm = crate::rigid::rayleigh_quotients(&acoustic, &weighted)
+        .iter()
+        .map(|&lam| crate::hessian::signed_wavenumber(lam).abs())
+        .fold(0.0_f64, f64::max);
+    crate::rigid::project_out_symmetric(&acoustic, &mut weighted);
+
+    let (mut eigenvalues, modes) = symmetric_eigen(&weighted)?;
+    for index in crate::rigid::rigid_mode_indices(&acoustic, &modes) {
+        eigenvalues[index] = 0.0;
+    }
     let frequencies_cm = eigenvalues
         .iter()
-        .map(|value| {
-            let magnitude = value.abs().sqrt() * crate::hessian::SQRT_EV_PER_ANG2_AMU_TO_CM;
-            if *value < 0.0 {
-                -magnitude
-            } else {
-                magnitude
-            }
-        })
+        .map(|&value| crate::hessian::signed_wavenumber(value))
         .collect();
-    Ok((frequencies_cm, eigenvalues))
+    Ok(Diagonalized {
+        frequencies_cm,
+        eigenvalues,
+        modes,
+        masses,
+        acoustic_residual_cm: residual_cm,
+    })
 }
 
 /// The CPHF response: the part of the second derivative that comes from the density moving.
 fn response(
     molecule: &Molecule,
     params: &Pm3Parameters,
+    options: &Pm3Options,
     periodic: &PeriodicOptions,
     scf: &PeriodicResult,
     basis: &Basis,
@@ -612,7 +769,7 @@ fn response(
 
     let responses: Vec<Matrix> = g_ov
         .par_iter()
-        .map(|rhs| cphf(rhs, &denominator, &cv, &co, &kernel))
+        .map(|rhs| cphf(rhs, &denominator, &cv, &co, &kernel, options.cphf_max_iter))
         .collect::<Result<Vec<_>>>()?;
 
     for (b, u) in responses.iter().enumerate() {
@@ -645,6 +802,7 @@ fn cphf(
     cv: &Matrix,
     co: &Matrix,
     kernel: &super::kernel::PeriodicKernel,
+    max_iter: usize,
 ) -> Result<Matrix> {
     let divide = |numerator: &Matrix| -> Matrix {
         let mut u = numerator.clone();
@@ -662,7 +820,7 @@ fn cphf(
     let max_diis = 8;
     let mut converged = false;
     let mut residual = f64::INFINITY;
-    for _ in 0..PERIODIC_CPHF_ITERATIONS {
+    for _ in 0..max_iter {
         // The AO-basis response density for the current `U`, symmetrized and scaled the way the
         // closed-shell density is.
         let response_density = ao_response_density(&u, cv, co);
@@ -695,21 +853,20 @@ fn cphf(
     }
     if !converged {
         return Err(Pm3Error::ScfNotConverged {
-            iterations: PERIODIC_CPHF_ITERATIONS,
+            iterations: max_iter,
             error: residual,
+            diagnosis: None,
         });
     }
     Ok(u)
 }
 
-/// How many passes the Γ-point periodic response takes before it has failed.
-///
-/// Headroom, for the same reason as [`crate::hessian::CPHF_ITERATIONS`], and with the same
-/// history: at two hundred, and with no extrapolation at all, a water chain's response stopped
-/// at a residual of `1.2e-7` against a declared tolerance of `1e-10` and returned it as though
-/// it had converged. This loop now extrapolates with the shared Pulay solve and checks that it
-/// arrived.
-const PERIODIC_CPHF_ITERATIONS: usize = 400;
+// How many passes the Γ-point periodic response takes before it has failed is
+// `Pm3Options::cphf_max_iter`, whose default of 400 is the constant that used to live here.
+// Headroom, for the same reason as `crate::hessian::CPHF_ITERATIONS`, and with the same history:
+// at two hundred, and with no extrapolation at all, a water chain's response stopped at a
+// residual of `1.2e-7` against a declared tolerance of `1e-10` and returned it as though it had
+// converged. This loop now extrapolates with the shared Pulay solve and checks that it arrived.
 
 /// Convergence on the RMS change of the response between passes.
 const PERIODIC_CPHF_TOLERANCE: f64 = 1.0e-10;
@@ -912,18 +1069,35 @@ mod tests {
         let mut magnitudes: Vec<f64> = phonons.frequencies_cm.iter().map(|f| f.abs()).collect();
         magnitudes.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-        // Three acoustic branches at zero. That is a statement about translational invariance and
-        // holds in any crystal.
-        assert!(
-            magnitudes[2] < 5.0,
-            "the three acoustic modes should vanish, largest is {:.3} cm⁻¹",
-            magnitudes[2]
+        // Three acoustic branches at **exactly** zero. That is a statement about translational
+        // invariance and holds in any crystal, so it is imposed by projecting the three
+        // translations out of the mass-weighted matrix rather than checked to within 5 cm⁻¹.
+        assert_eq!(
+            phonons.frequencies_cm.iter().filter(|f| **f == 0.0).count(),
+            3,
+            "expected exactly three zeros, got {:?}",
+            phonons.frequencies_cm
         );
+        assert_eq!(magnitudes[2], 0.0);
+        // `acoustic_residual_cm` is now the **pre**-projection number, so it is a measurement of
+        // the lattice sums rather than a restatement of what the projection just did. Small, and
+        // genuinely non-zero -- reading it off the projected spectrum, as 0.2.3 did, could only
+        // ever return zero and so could never have failed.
         assert!(
-            phonons.acoustic_residual_cm < 5.0,
-            "the reported residual disagrees: {:.3} cm⁻¹",
+            phonons.acoustic_residual_cm > 0.0 && phonons.acoustic_residual_cm < 5.0,
+            "the pre-projection acoustic residual is {:.3} cm⁻¹",
             phonons.acoustic_residual_cm
         );
+        // And the Hessian handed back is the raw one: symmetric, with nothing imposed on it.
+        for i in 0..phonons.hessian.rows {
+            for j in 0..i {
+                assert_eq!(
+                    phonons.hessian[(i, j)],
+                    phonons.hessian[(j, i)],
+                    "the returned Hessian is not symmetric at ({i}, {j})"
+                );
+            }
+        }
 
         // The *librations* are also soft here, and deliberately not asserted against. An 18 Bohr
         // cell of water is essentially a gas of non-interacting molecules, so rotating one costs

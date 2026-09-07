@@ -60,7 +60,7 @@ pub fn ewald_atom_hessian(
     }
     let mut hessian = Matrix::zeros(3 * n_atoms, 3 * n_atoms);
     real_space(cell, sites, params, &mut hessian);
-    reciprocal(cell, sites, params, &mut hessian);
+    reciprocal(cell, sites, params, n_atoms, &mut hessian);
     remove_excluded_smooth_part(sites, params, &mut hessian);
     // The self and background terms do not depend on where the sites are, so they contribute
     // nothing here.
@@ -232,40 +232,107 @@ fn excluded(sites: &[ChargeSite], a: usize, b: usize, t: [i32; 3]) -> bool {
 /// and the on-site block is minus the sum of that row — the reciprocal sum satisfies the acoustic
 /// sum rule term by term, which is worth knowing when a phonon calculation comes out with a
 /// non-zero acoustic branch: the cause is not here.
-fn reciprocal(cell: &Cell, sites: &[ChargeSite], params: &EwaldParams, hessian: &mut Matrix) {
+fn reciprocal(
+    cell: &Cell,
+    sites: &[ChargeSite],
+    params: &EwaldParams,
+    n_atoms: usize,
+    hessian: &mut Matrix,
+) {
+    use rayon::prelude::*;
+
     let volume = cell.measure();
     // 2π/V, doubled because only half of each ±G pair is enumerated.
     let prefactor = 2.0 * TAU / volume;
     let inv_four_alpha2 = 1.0 / (4.0 * params.alpha * params.alpha);
+    let gvectors = crate::pbc::ewald::reciprocal_vectors_for(cell, params.gmax);
 
-    for g in crate::pbc::ewald::reciprocal_vectors_for(cell, params.gmax) {
-        let g2 = g.norm2();
-        let amplitude = (-g2 * inv_four_alpha2).exp() / g2;
-        if amplitude == 0.0 {
-            continue;
-        }
-        let scale = PM3_EV * prefactor * amplitude * 2.0;
-        let components = g.to_array();
-        let phases: Vec<(f64, f64)> = sites
-            .iter()
-            .map(|s| {
-                let (sin, cos) = g.dot(s.position).sin_cos();
-                (cos, sin)
-            })
-            .collect();
+    // **Per-atom structure factors, not a loop over site pairs.**
+    //
+    // This was `O(N_G · N_sites²)` and is the largest single phase of a Γ-point Hessian —
+    // measured at 62% of a 48-atom run, against 38% for the coupled-perturbed response everyone
+    // assumes is the expensive part and under 1% for the skeleton
+    // (`examples/hessian_profile.rs`).
+    //
+    // The inner sum is a structure factor in disguise. What the site loop accumulates for an
+    // atom pair `(A, B)` is `Σ_{a∈A, b∈B} q_a q_b cos(G·(r_a − r_b))`, and that is exactly
+    // `Re[S_A S_B*]` for `S_A(G) = Σ_{a∈A} q_a e^{iG·r_a}`. For the same-atom pairs the site
+    // loop visits — which exist because the real-space sum excludes them and the reciprocal sum
+    // does not — the sum over `a < b` within `A` is `½(|S_A|² − Σ_{a∈A} q_a²)`.
+    //
+    // So `N_sites²` becomes `N_sites` to build the factors plus `N_atoms²` to combine them. PM3
+    // puts four to five multipole sites on every heavy atom, so that is roughly a twentyfold cut
+    // in the inner work before any parallelism.
+    //
+    // The site list is grouped by owner in increasing order, which is what makes the two forms
+    // visit the same unordered pairs. `debug_assert` rather than a runtime check: it is a
+    // property of how `pbc::gamma` builds the list, not of the input.
+    debug_assert!(
+        sites.windows(2).all(|w| w[0].owner <= w[1].owner),
+        "the reciprocal Hessian's structure-factor form needs the sites grouped by owner"
+    );
 
-        for a in 0..sites.len() {
-            for b in (a + 1)..sites.len() {
-                // cos(G·(r_a − r_b)) from the stored phases, without another trig call.
-                let cosine = phases[a].0 * phases[b].0 + phases[a].1 * phases[b].1;
-                let coefficient = scale * sites[a].charge * sites[b].charge * cosine;
-                let mut block = [[0.0; 3]; 3];
-                for (alpha, row) in block.iter_mut().enumerate() {
-                    for (beta, slot) in row.iter_mut().enumerate() {
-                        *slot = coefficient * components[alpha] * components[beta];
+    // One partial Hessian per chunk of G, summed in chunk order. Fixed chunks reduced in index
+    // order rather than `par_iter().reduce()`, so the last bits do not depend on which thread
+    // finished first — the same reason the Ewald energy is written that way.
+    let chunk = gvectors
+        .len()
+        .div_ceil(rayon::current_num_threads().max(1) * 4)
+        .max(1);
+    let partials: Vec<Matrix> = gvectors
+        .par_chunks(chunk)
+        .map(|gs| {
+            let mut partial = Matrix::zeros(3 * n_atoms, 3 * n_atoms);
+            let mut sre = vec![0.0f64; n_atoms];
+            let mut sim = vec![0.0f64; n_atoms];
+            let mut q2 = vec![0.0f64; n_atoms];
+            for g in gs {
+                let g2 = g.norm2();
+                let amplitude = (-g2 * inv_four_alpha2).exp() / g2;
+                if amplitude == 0.0 {
+                    continue;
+                }
+                let scale = PM3_EV * prefactor * amplitude * 2.0;
+                let components = g.to_array();
+
+                sre.iter_mut().for_each(|v| *v = 0.0);
+                sim.iter_mut().for_each(|v| *v = 0.0);
+                q2.iter_mut().for_each(|v| *v = 0.0);
+                for site in sites {
+                    let (sin, cos) = g.dot(site.position).sin_cos();
+                    sre[site.owner] += site.charge * cos;
+                    sim[site.owner] += site.charge * sin;
+                    q2[site.owner] += site.charge * site.charge;
+                }
+
+                let mut place = |a: usize, b: usize, weight: f64| {
+                    let coefficient = scale * weight;
+                    let mut block = [[0.0; 3]; 3];
+                    for (alpha, row) in block.iter_mut().enumerate() {
+                        for (beta, slot) in row.iter_mut().enumerate() {
+                            *slot = coefficient * components[alpha] * components[beta];
+                        }
+                    }
+                    scatter(&mut partial, a, b, &block);
+                };
+
+                for a in 0..n_atoms {
+                    // The site pairs inside atom `a`, which the site loop reached as `a < b`
+                    // with both owners equal.
+                    place(a, a, 0.5 * (sre[a] * sre[a] + sim[a] * sim[a] - q2[a]));
+                    for b in (a + 1)..n_atoms {
+                        place(a, b, sre[a] * sre[b] + sim[a] * sim[b]);
                     }
                 }
-                scatter(hessian, sites[a].owner, sites[b].owner, &block);
+            }
+            partial
+        })
+        .collect();
+
+    for partial in partials {
+        for i in 0..hessian.rows {
+            for j in 0..hessian.cols {
+                hessian[(i, j)] += partial[(i, j)];
             }
         }
     }

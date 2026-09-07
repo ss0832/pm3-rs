@@ -1,34 +1,34 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Periodic boundary conditions for the NDDO model: 1D chains, 2D slabs and 3D crystals,
-//! at the ﾎ・point or over a k-point mesh.
+//! at the Γ point or over a k-point mesh.
 //!
 //! # How the electrostatics are split
 //!
-//! Every two-center Coulomb term in PM3 窶・electron窶兎lectron, electron窶田ore and core窶田ore 窶・is
-//! built from the Dewar窶典hiel multipole model, which places a handful of point charges at
-//! fixed offsets from each nucleus and interacts them through the Klopman窶徹hno screened form
-//! `q_i q_j / 竏・rﾂｲ + a)` rather than `q_i q_j / r`. Under a lattice sum this matters twice
+//! Every two-center Coulomb term in PM3 — electron–electron, electron–core and core–core — is
+//! built from the Dewar–Thiel multipole model, which places a handful of point charges at
+//! fixed offsets from each nucleus and interacts them through the Klopman–Ohno screened form
+//! `q_i q_j / √(r² + a)` rather than `q_i q_j / r`. Under a lattice sum this matters twice
 //! over: the `1/r` part is only conditionally convergent, and the screening leaves a spurious
-//! `竏誕/(2rﾂｳ)` tail whose 3D lattice sum diverges logarithmically.
+//! `−a/(2r³)` tail whose 3D lattice sum diverges logarithmically.
 //!
 //! Both are handled by one split:
 //!
 //! ```text
-//! E = Ewald[ ﾎ｣_conf q_i q_j / r_ij ]  +  ﾎ｣_{|r| < r_off} [ W_KO(r) 竏・W_point(r) ] ﾂｷ f(r)
+//! E = Ewald[ Σ_conf q_i q_j / r_ij ]  +  Σ_{|r| < r_off} [ W_KO(r) − W_point(r) ] · f(r)
 //! ```
 //!
 //! * The **Ewald** part sees only the point limit of the very same multipole configurations,
 //!   so the split is exact by construction rather than by approximation, and it inherits the
 //!   absolute convergence and well-defined boundary conventions of a point-charge Ewald sum.
-//! * The **short-range correction** carries the Klopman窶徹hno screening, smoothly switched off
-//!   between `r_on` and `r_off` by a Cﾂｲ quintic. That switch removes the `竏誕/(2rﾂｳ)` artefact
+//! * The **short-range correction** carries the Klopman–Ohno screening, smoothly switched off
+//!   between `r_on` and `r_off` by a C² quintic. That switch removes the `−a/(2r³)` artefact
 //!   rather than summing it: real spherical charge distributions interact exactly as `q_i q_j / r`
 //!   once they stop overlapping, so the tail is an artefact of the interpolation formula, not
 //!   physics. It is a documented approximation, and its `r_off` convergence is a test.
 //!
-//! Everything else 窶・resonance `ﾎｲﾂｷS`, exchange, the exponential and Gaussian core-core terms,
-//! and the classical D3/H4/X corrections 窶・decays exponentially or as `1/r竅ｶ` and needs only a
+//! Everything else — resonance `β·S`, exchange, the exponential and Gaussian core-core terms,
+//! and the classical D3/H4/X corrections — decays exponentially or as `1/r⁶` and needs only a
 //! real-space cutoff.
 //!
 //! # Dimensionality
@@ -62,13 +62,13 @@ pub mod ewald_reference;
 
 /// Refuse a uniform external electric field under periodic boundary conditions.
 ///
-/// `竏断ﾂｷr` is unbounded and not lattice-periodic, so there is no periodic Hamiltonian to add it
+/// `−f·r` is unbounded and not lattice-periodic, so there is no periodic Hamiltonian to add it
 /// to: the potential drops without limit across every cell, and the "energy per cell" a
 /// calculation would report depends on which cell was chosen. The physical treatment is a Berry
 /// phase, which is a different calculation rather than a bigger one.
 ///
-/// An isolated cell would be a legitimate place for a field 窶・`竏断ﾂｷr` is well-defined with no
-/// lattice to be non-periodic against 窶・but this machinery does not carry one: nothing under
+/// An isolated cell would be a legitimate place for a field — `−f·r` is well-defined with no
+/// lattice to be non-periodic against — but this machinery does not carry one: nothing under
 /// `pbc` reads `Pm3Options::field`, so allowing it there would drop the field silently rather
 /// than honour it. It is refused too, and the message says which of the two reasons applies.
 /// `run_dc_screened` reaches this path with `Cell::isolated`, so this is also what keeps a
@@ -84,7 +84,7 @@ pub(crate) fn refuse_field(
     if periodic > 0 {
         return Err(crate::error::Pm3Error::InvalidInput(
             "a uniform electric field is not compatible with periodic boundary conditions: \
-             `竏断ﾂｷr` is not lattice-periodic, so the energy per cell would depend on which cell \
+             `−f·r` is not lattice-periodic, so the energy per cell would depend on which cell \
              was chosen. Use an isolated cell, or a Berry-phase treatment, which is not \
              implemented."
                 .to_string(),

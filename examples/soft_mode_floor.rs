@@ -1,16 +1,25 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Where the soft-mode floor sits between the acoustic branch and the softest real mode.
+//! What projecting the acoustic branch out does to the mass-weighted Γ eigenvalues.
 //!
 //! ```text
 //! cargo run --release --example soft_mode_floor
 //! ```
 //!
-//! `static_dielectric_tensor` weights each mode by `1/ω²`, so it must exclude the acoustic branch
-//! -- and cannot do it by testing `ω² ≤ 0`, because an acoustic mode that lands a hair above zero
-//! then contributes an enormous term instead of none. The threshold is therefore a floor, and a
-//! floor is only defensible if there is a gap to put it in. This prints the mass-weighted Γ
-//! eigenvalues on both sides of it so the constant is chosen from the gap rather than guessed.
+//! `static_dielectric_tensor` weights each mode by `1/ω²`, so it must exclude the acoustic branch.
+//! Through 0.2.3 it did that with a floor — `ω² ≤ 1e-6` — because an acoustic mode that lands a
+//! hair *above* zero contributes an enormous term rather than none, and testing `ω² ≤ 0` would
+//! let it through whenever the arithmetic noise came out positive. The floor was chosen from a
+//! measured gap, and the gap was wide: this program is what measured it.
+//!
+//! It is gone now. The three translations are exact null vectors of `D(0)`, so they are projected
+//! out before diagonalization and land at **exactly** zero rather than at `±1e-15`; the sum then
+//! tests `ω² ≤ 0` and no magnitude is involved. This prints both columns — before and after — so
+//! the change is visible rather than asserted, and so the gap is still on the record.
+//!
+//! The reason it matters is not the acoustic branch, which was never in danger. It is the other
+//! side of the floor: a genuinely soft mode in a cell near a phase transition is a real mode with
+//! a small `ω²`, and a constant chosen on water in a box has no business deciding it is noise.
 
 use pm3_rs::pbc::gamma::PeriodicOptions;
 use pm3_rs::{Cell, Molecule, Pm3Options, Pm3Parameters, Vec3};
@@ -38,11 +47,12 @@ fn main() {
     let options = Pm3Options::default();
     let periodic = PeriodicOptions::default();
 
-    println!("floor = {:e} (eV/(A^2 amu))", pm3_rs::SOFT_MODE_FLOOR);
+    println!("mass-weighted Gamma eigenvalues, three lowest, eV/(A^2 amu)");
+    println!("`skipped` is what static_dielectric_tensor leaves out of the 1/w^2 sum.");
     println!();
     println!(
-        "{:>10}  {:>9}  mass-weighted Gamma eigenvalues, six lowest",
-        "cell (A)", "skipped"
+        "{:>10}  {:>7}  {:>32}  {:>32}",
+        "cell (A)", "skipped", "unprojected", "acoustic projected out"
     );
 
     let mut widths: Vec<f64> = vec![6.0, 9.0, 12.0];
@@ -71,15 +81,39 @@ fn main() {
                 }
             }
         }
-        let (eigenvalues, _) = pm3_rs::cmatrix::hermitian_eigen(&weighted).unwrap();
-        let mut values: Vec<f64> = (0..ndof).map(|i| eigenvalues[i]).collect();
-        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let (bare, _) = pm3_rs::cmatrix::hermitian_eigen(&weighted).unwrap();
+        let mut before: Vec<f64> = (0..ndof).map(|i| bare[i]).collect();
+        before.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-        let skipped = values
-            .iter()
-            .filter(|v| **v <= pm3_rs::SOFT_MODE_FLOOR)
-            .count();
-        let text: Vec<String> = values.iter().take(6).map(|v| format!("{v:+.3e}")).collect();
-        println!("{angstrom:>10.5}  {skipped:>9}  {}", text.join(" "));
+        // The same projection `static_dielectric_tensor` applies, so this column is what it
+        // actually sums over rather than something merely similar.
+        let positions: Vec<Vec3> = molecule.atoms.iter().map(|a| a.position).collect();
+        let acoustic = pm3_rs::rigid::rigid_body_basis(
+            &positions,
+            &dynamical.masses,
+            pm3_rs::rigid::RigidMotions::TranslationsOnly,
+        );
+        pm3_rs::rigid::project_out_hermitian(&acoustic, &mut weighted);
+        let (projected, vectors) = pm3_rs::cmatrix::hermitian_eigen(&weighted).unwrap();
+        let mut after: Vec<f64> = (0..ndof).map(|i| projected[i]).collect();
+        for index in pm3_rs::rigid::rigid_mode_indices_complex(&acoustic, &vectors) {
+            after[index] = 0.0;
+        }
+        after.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let skipped = after.iter().filter(|v| **v <= 0.0).count();
+        let show = |values: &[f64]| {
+            values
+                .iter()
+                .take(3)
+                .map(|v| format!("{v:+.3e}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        println!(
+            "{angstrom:>10.5}  {skipped:>7}  {:>32}  {:>32}",
+            show(&before),
+            show(&after)
+        );
     }
 }

@@ -14,6 +14,7 @@
 pub mod d3;
 pub mod h4;
 pub mod hx;
+pub mod mmok;
 pub mod periodic;
 
 use crate::dual::Scalar;
@@ -72,6 +73,26 @@ pub(crate) fn dist_g<S: Scalar>(a: &[S; 3], b: &[S; 3]) -> S {
 /// examples above are the measurements a future attempt should start from.
 pub fn correction_energy_g<S: Scalar>(numbers: &[u8], pos: &[[S; 3]], variant: Variant) -> S {
     correction_energy_cluster_g(numbers, pos, numbers.len(), None, None, None, None, variant)
+}
+
+/// [`correction_energy_g`] plus MOPAC's `MMOK` amide term when `mmok` is set.
+///
+/// Kept separate from `Variant` because it is orthogonal to it: `MMOK` is not a dispersion
+/// or hydrogen-bond correction and composes with any of them, and it is not part of PM3 at
+/// all — see [`mmok`]. Going through the same generic scalar means the gradient and Hessian
+/// pick it up from the same expression.
+pub fn correction_energy_with_mmok_g<S: Scalar>(
+    numbers: &[u8],
+    pos: &[[S; 3]],
+    variant: Variant,
+    mmok: bool,
+) -> S {
+    let base = correction_energy_g(numbers, pos, variant);
+    if mmok {
+        base + mmok::amide_correction_g(numbers, pos)
+    } else {
+        base
+    }
 }
 
 /// Total correction energy **per unit cell** (eV) over an image-expanded cluster.
@@ -214,4 +235,16 @@ pub fn correction_energies(mol: &Molecule, variant: Variant) -> CorrectionEnergi
 /// Total correction energy (eV) for the variant.
 pub fn correction_energy(mol: &Molecule, variant: Variant) -> f64 {
     correction_energies(mol, variant).total()
+}
+
+/// [`correction_energy`] plus the `MMOK` amide term when `mmok` is set.
+pub fn correction_energy_with_mmok(mol: &Molecule, variant: Variant, mmok: bool) -> f64 {
+    let mut total = correction_energy(mol, variant);
+    if mmok {
+        // `geometry_f64` is the same Bohr-valued view the gradient path differentiates, so
+        // the energy here and the gradient there cannot drift apart in units.
+        let (numbers, pos) = geometry_f64(mol);
+        total += mmok::amide_correction_g(&numbers, &pos);
+    }
+    total
 }

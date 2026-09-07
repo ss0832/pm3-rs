@@ -89,7 +89,7 @@ pub struct AtomSites {
     /// Indexed by [`packed_index`].
     pub pair_weights: Vec<Vec<SiteWeight>>,
     /// Number of AOs on the atom: 0 for a sparkle or point charge, 1 for an s-only element,
-    /// 4 for an sp one, 9 for a `d` one (built by [`AtomSites::build_spd`]). No PM3 element has
+    /// 4 for an sp one, 9 for a `d` one (built by `AtomSites::build_spd`). No PM3 element has
     /// a `d` shell, so that path is exercised by a synthetic element rather than a real one —
     /// see `no_pm3_element_carries_a_d_shell`.
     pub n_orb: usize,
@@ -813,7 +813,7 @@ mod tests {
     /// This used to be `d_elements_are_refused`, asserting `build` returned `None` for zinc —
     /// guarded by `if zinc.has_d()`, which is false for every one of the forty-two, so the
     /// assertion never ran. It survived the change that made `build` realize `d` elements
-    /// through [`AtomSites::build_spd`] precisely because it never ran. A test whose subject
+    /// through `AtomSites::build_spd` precisely because it never ran. A test whose subject
     /// does not exist reports the same thing whether the code is right or wrong.
     #[test]
     fn no_pm3_element_carries_a_d_shell() {

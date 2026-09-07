@@ -105,6 +105,70 @@ def test_documented_common_arguments():
     assert energy["pm3-d3h4x"] == energy["pm3-d3h4"]
 
 
+# Acetamide at its PM3 minimum: the geometry from tests/data/mopac_oracle.tsv.
+ACETAMIDE_Z = [8, 6, 7, 6, 1, 1, 1, 1, 1]
+ACETAMIDE_R = np.array(
+    [
+        [0.443779398, 1.296449633, -0.035323927],  # O
+        [0.052004373, 0.138591678, -0.005705918],  # C
+        [1.033082758, -0.888429398, -0.066016666],  # N
+        [-1.395111112, -0.272769730, -0.000022728],  # C
+        [0.760253342, -1.735205329, 0.378344955],  # H (amide)
+        [-2.061780078, 0.599727626, 0.013338598],  # H
+        [-1.639979626, -0.861723040, -0.894240325],  # H
+        [-1.632894254, -0.884590928, 0.880357946],  # H
+        [1.959783051, -0.608911632, 0.167787223],  # H (amide)
+    ]
+)
+
+
+def test_mmok_rides_on_the_method_string_and_is_off_by_default():
+    """``+mmok`` selects MOPAC's amide correction; plain ``pm3`` must not include it.
+
+    MOPAC applies MMOK by default and pm3-rs does not, which is the one place the two
+    codes disagree about what "PM3" means. The correction is post-SCF, so it moves the
+    heat of formation and leaves the density alone -- that asymmetry is the assertion.
+    """
+    plain = native.single_point(ACETAMIDE_Z, ACETAMIDE_R, method="pm3")
+    corrected = native.single_point(ACETAMIDE_Z, ACETAMIDE_R, method="pm3+mmok")
+
+    # MOPAC v23.2.5 at this geometry: -51.032295890 with NOMM, -48.705646220 by default.
+    assert abs(plain["heat_of_formation_kcal"] - (-51.032_295_890)) < 2e-3
+    assert abs(corrected["heat_of_formation_kcal"] - (-48.705_646_220)) < 2e-3
+
+    # Post-SCF: same wavefunction, different reported heat of formation.
+    assert plain["electronic_ev"] == corrected["electronic_ev"]
+    assert plain["homo_ev"] == corrected["homo_ev"]
+    assert plain["charges"] == corrected["charges"]
+
+    # It composes with the correction variants rather than replacing them.
+    assert native.single_point(ACETAMIDE_Z, ACETAMIDE_R, method="pm3-d3h4+mmok")[
+        "energy_ev"
+    ] != native.single_point(ACETAMIDE_Z, ACETAMIDE_R, method="pm3-d3h4")["energy_ev"]
+
+    # And a molecule with no amide is untouched by it.
+    assert (
+        native.single_point(WATER_Z, WATER_R, method="pm3+mmok")["energy_ev"]
+        == native.single_point(WATER_Z, WATER_R, method="pm3")["energy_ev"]
+    )
+
+
+def test_mmok_reaches_the_gradient_and_not_only_the_energy():
+    """The term is differentiated, so an optimization with it on minimizes what it reports.
+
+    Written over the crate's dual numbers, so this is really a check that the flag reached
+    the gradient path at all -- a correction that moved the energy and not the forces would
+    make ``optimize`` walk downhill on one surface and report another.
+    """
+    plain = native.gradient(ACETAMIDE_Z, ACETAMIDE_R, method="pm3")
+    corrected = native.gradient(ACETAMIDE_Z, ACETAMIDE_R, method="pm3+mmok")
+    difference = np.abs(
+        np.asarray(corrected["gradient_ev_per_angstrom"])
+        - np.asarray(plain["gradient_ev_per_angstrom"])
+    ).max()
+    assert difference > 1e-3, "the amide torsion term never reached the gradient"
+
+
 def test_inputs_accept_lists_and_arrays():
     a = native.single_point(WATER_Z, WATER_R)
     b = native.single_point(np.asarray(WATER_Z), WATER_R.tolist())
@@ -175,15 +239,27 @@ def test_optimize_documented_keys():
 def test_frequencies_documented_keys_and_ordering():
     opt = native.optimize(WATER_Z, WATER_R)
     result = native.frequencies(WATER_Z, opt["positions_angstrom"])
-    assert {"frequencies_cm", "eigenvalues"} <= set(result)
+    assert {"frequencies_cm", "eigenvalues", "n_rigid", "rigid_residual_cm"} <= set(result)
     frequencies = np.asarray(result["frequencies_cm"])
     assert frequencies.shape == (9,)
     assert np.asarray(result["eigenvalues"]).shape == (9,)
     # "ascending; negatives are imaginary"
     assert np.all(np.diff(frequencies) >= -1e-9)
-    # 6 translations/rotations near zero, then the 3 real vibrations.
-    assert np.all(np.abs(frequencies[:6]) < 50.0), frequencies[:6]
-    for got, want in zip(frequencies[6:], ORACLE_FREQUENCIES):
+    # Six translations/rotations at **exactly** zero -- projected out, not recognised for being
+    # small -- then the three real vibrations. `n_rigid` is the rank of the rigid-body subspace,
+    # found from the geometry, so a caller no longer has to know that a bent triatomic has six.
+    #
+    # `== 0.0`, not `< 1e-6`: those eigenvalues are *assigned* zero after the projection
+    # identifies them by their overlap with the rigid-body subspace, so exactness is by
+    # construction rather than by luck, and a tolerance would assert less than is true. Counted
+    # rather than sliced, because the zeros lead the list only at a minimum -- an imaginary mode
+    # sorts below them.
+    assert result["n_rigid"] == 6
+    assert int(np.sum(frequencies == 0.0)) == result["n_rigid"], frequencies
+    # What those directions carried before projection is still reported, as the measure of the
+    # Hessian's quality that the old `< 50.0` bound was really testing.
+    assert 0.0 < result["rigid_residual_cm"] < 50.0, result["rigid_residual_cm"]
+    for got, want in zip(frequencies[result["n_rigid"] :], ORACLE_FREQUENCIES):
         assert abs(got - want) < 3.0, f"{got} vs MOPAC {want}"
 
 
@@ -368,7 +444,9 @@ def test_documented_ase_example_block():
 
     assert math.isfinite(energy)
     assert hessian.shape == (9, 9)
-    assert np.all(np.abs(frequencies[:6]) < 100.0), frequencies[:6]
+    # Exactly zero, not "< 100.0" -- the rigid-body subspace is projected out of the mass-weighted
+    # Hessian and those eigenvalues are then assigned zero, so this is exact by construction.
+    assert int(np.sum(frequencies == 0.0)) == 6, frequencies
     assert np.all((frequencies[6:] > 1000.0) & (frequencies[6:] < 4200.0)), frequencies[6:]
 
     # README's block.
@@ -431,6 +509,179 @@ def test_the_console_script_computes_the_same_energy_as_the_api(tmp_path, capfd)
     printed_energy = float(line.split(":", 1)[1].strip().split()[0])
     assert abs(printed_energy - reference) < 1.0e-6, (
         f"the command printed {printed_energy} where the library gives {reference}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Every command, through the installed console script
+#
+# The Rust side crosses every command against every flag (`src/cli.rs`, the
+# `every_command_and_flag_combination_parses_or_explains_itself` matrix), but it calls
+# `parse_args` and `run` directly. That is the parser and the dispatch; it is not the
+# path a user takes. `pip install` puts a `pm3-rs` command on the path that goes
+# Python -> `_native.cli_main` -> Rust, and until now exactly one command -- `energy` --
+# was ever exercised across that boundary.
+#
+# What this layer catches that the Rust one cannot: a command reachable in Rust and not
+# through the entry point, an exit code that does not survive the crossing, and a
+# promised output file that never appears.
+# ---------------------------------------------------------------------------
+
+WATER_XYZ = "3\nwater\nO 0.0 0.0 0.0\nH 0.9584 0.0 0.0\nH -0.24 0.9278 0.0\n"
+
+# 18 Bohr. Every periodic width must exceed the 14 Bohr short-range cutoff or the
+# Gamma-point answer is wrong regardless of how cleanly it converged; see
+# tests/test_periodic_python_api.py, which explains why 14 Bohr is a trap and not a
+# boundary.
+CELL_ANGSTROM = "9.525"
+
+# command -> (extra argv, the file it documents itself as writing)
+MOLECULAR_COMMANDS = {
+    "energy": ([], None),
+    "gradient": ([], None),
+    "charges": ([], None),
+    "orbitals": ([], None),
+    "orbitals --coefficients": (["--coefficients"], None),
+    "frequencies": ([], None),
+    "hessian": ([], None),
+    "ir": ([], None),
+    "optimize": ([], "water.pm3opt.xyz"),
+    "molden": ([], "water.molden"),
+    "molden --sto": (["--sto"], "water.molden"),
+}
+
+PERIODIC_COMMANDS = {
+    "energy": [],
+    "charges": [],
+    "stress": [],
+    "phonons": [],
+    "bands": [],
+    "born": [],
+    "dielectric": [],
+    "berry": [],
+    "phonon-bands": ["--supercell", "2,1,1"],
+    # The one command with required flags of its own: a field to apply, and the k-mesh
+    # whose strings the Berry phase is taken along.
+    "finite-field": ["--field", "0.001,0,0", "--kpts", "3,1,1"],
+}
+
+
+@pytest.mark.parametrize("case", sorted(MOLECULAR_COMMANDS))
+def test_every_molecular_command_runs_through_the_console_script(case, tmp_path, capfd):
+    """Exit code 0, some output, and the artifact the usage text promises."""
+    from pm3_rs import cli
+
+    extra, artifact = MOLECULAR_COMMANDS[case]
+    command = case.split()[0]
+    xyz = tmp_path / "water.xyz"
+    xyz.write_text(WATER_XYZ)
+    if artifact:
+        target = tmp_path / artifact
+        target.unlink(missing_ok=True)
+
+    code = cli.main(["pm3-rs", command, str(xyz), *extra])
+    printed = capfd.readouterr().out
+    assert code == 0, f"`{case}` exited {code} through the console script"
+    assert printed.strip(), f"`{case}` printed nothing"
+
+    if artifact:
+        written = tmp_path / artifact
+        assert written.exists(), (
+            f"`{case}` documents itself as writing {artifact} and did not. Through the "
+            f"entry point that is indistinguishable from success."
+        )
+        assert written.stat().st_size > 0, f"`{case}` wrote an empty {artifact}"
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("command", sorted(PERIODIC_COMMANDS))
+def test_every_periodic_command_runs_through_the_console_script(command, tmp_path, capfd):
+    """The same, for the commands that need a lattice.
+
+    Marked slow: each is a lattice sum, and several are response solves on top -- seconds
+    each rather than milliseconds. Run without them using ``-m "not slow"``.
+    """
+    from pm3_rs import cli
+
+    xyz = tmp_path / "water.xyz"
+    xyz.write_text(WATER_XYZ)
+
+    code = cli.main(
+        ["pm3-rs", command, str(xyz), "--cell", CELL_ANGSTROM, *PERIODIC_COMMANDS[command]]
+    )
+    printed = capfd.readouterr().out
+    assert code == 0, f"periodic `{command}` exited {code} through the console script"
+    assert printed.strip(), f"periodic `{command}` printed nothing"
+
+
+@pytest.mark.slow
+def test_a_periodic_optimization_writes_the_cell_into_the_geometry_it_saves(tmp_path, capfd):
+    """The relaxed structure has to carry its lattice, or the answer is half-thrown-away.
+
+    Plain XYZ has nowhere to put a cell. While the CLI could only hold the cell fixed that
+    was merely incomplete -- the caller still had the cell they passed in. With
+    ``--relax-cell`` the lattice *is* the result, so dropping it loses the part of the
+    answer that took the work. The extended-XYZ ``Lattice="..."`` comment is how it
+    survives, and this reads it back the way the next tool would.
+    """
+    from pm3_rs import cli
+
+    xyz = tmp_path / "water.xyz"
+    xyz.write_text(WATER_XYZ)
+    code = cli.main(
+        ["pm3-rs", "optimize", str(xyz), "--cell", CELL_ANGSTROM, "--max-steps", "2"]
+    )
+    capfd.readouterr()
+    assert code == 0
+
+    written = tmp_path / "water.pm3opt.xyz"
+    assert written.exists(), "the periodic optimizer wrote no geometry"
+    comment = written.read_text().splitlines()[1]
+    assert "Lattice=" in comment, (
+        f"the saved geometry has no lattice: {comment!r}. Everything downstream would read "
+        f"it as an isolated molecule."
+    )
+    assert "pbc=" in comment, f"the saved geometry does not say which axes are periodic: {comment!r}"
+
+    # Nine numbers, and they are the cell that went in -- this run holds it fixed.
+    vectors = comment.split('Lattice="', 1)[1].split('"', 1)[0].split()
+    assert len(vectors) == 9, f"expected nine lattice components, got {len(vectors)}: {vectors}"
+    edge = float(CELL_ANGSTROM)
+    assert float(vectors[0]) == pytest.approx(edge, abs=1e-6)
+    assert float(vectors[4]) == pytest.approx(edge, abs=1e-6)
+    assert float(vectors[8]) == pytest.approx(edge, abs=1e-6)
+
+
+@pytest.mark.parametrize("command", sorted(PERIODIC_COMMANDS))
+def test_a_command_that_needs_a_lattice_refuses_rather_than_inventing_one(
+    command, tmp_path, capfd
+):
+    """A periodic-only command without ``--cell`` must fail, and say why.
+
+    ``energy`` and ``charges`` are the two that legitimately run either way, so they are
+    the control: the point of the test is that the rest do not quietly produce a
+    molecular answer to a question that was about a crystal.
+    """
+    from pm3_rs import cli
+
+    xyz = tmp_path / "water.xyz"
+    xyz.write_text(WATER_XYZ)
+
+    code = cli.main(["pm3-rs", command, str(xyz)])
+    captured = capfd.readouterr()
+
+    if command in ("energy", "charges"):
+        assert code == 0, f"`{command}` runs on a molecule and must keep doing so"
+        return
+
+    assert code != 0, (
+        f"`{command}` needs a lattice and exited 0 without one. Either it invented a cell "
+        f"or it answered a different question than the one asked."
+    )
+    message = (captured.out + captured.err).lower()
+    assert "cell" in message, (
+        f"`{command}` failed without mentioning --cell; the message a user sees is "
+        f"{captured.out + captured.err!r}"
     )
 
 

@@ -11,7 +11,7 @@
 //! only when that donor–H bond is covalent (< 1.15 Å), matching MOPAC's
 //! `all_h_bonds`/`connected` selection. The water- and charged-group scaling
 //! factors use the distance-based covalent-valence measure
-//! [`cvalence_contribution`] (MOPAC `cvalence_contribution`, covalent radii
+//! `cvalence_contribution` (MOPAC `cvalence_contribution`, covalent radii
 //! from `radii_C`). The separate H–H repulsion [`hh_rep_energy`]
 //! (MOPAC `energy_corr_hh_rep`/`poly`) is added for the D3H4 family.
 //! PDB-residue-name-only HIP/GUA overrides from the Cuby interface are not part
@@ -67,7 +67,7 @@ const RAH: f64 = 1.15;
 const CUTOFF_DA: f64 = 5.5;
 
 /// Covalent radii (Å), elements 1..=118 — MOPAC `radii_C::covalent_radii`
-/// (H_bonds4.F90:18). Used only by [`cvalence_contribution`].
+/// (H_bonds4.F90:18). Used only by `cvalence_contribution`.
 const COVALENT_RADII: [f64; 118] = [
     0.37, 0.32, 1.34, 0.90, 0.82, 0.77, 0.75, 0.73, 0.71, 0.69, 1.54, 1.30, 1.18, 1.11, 1.06, 1.02,
     0.99, 0.97, 1.96, 1.74, 1.44, 1.36, 1.25, 1.27, 1.39, 1.25, 1.26, 1.21, 1.38, 1.31, 1.26, 1.22,

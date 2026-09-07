@@ -30,7 +30,7 @@
 //!
 //! `a = b, T ≠ 0` pairs are real two-electron terms between orbitals that all sit on one atom.
 //! They belong with the one-center block, not in the two-center pair loop, which would scatter
-//! them into that block twice. They are kept in [`Setup::self_images`] and applied alongside the
+//! them into that block twice. They are kept in `Setup::self_images` and applied alongside the
 //! ordinary one-center integrals.
 //!
 //! # Coulomb is split; exchange is not
@@ -329,6 +329,13 @@ pub(crate) fn occupancy(
 }
 
 /// Run a Γ-point periodic PM3 calculation.
+/// The mixing fraction the Γ path retries with, and how long it gives the retry.
+///
+/// The same 0.9 the k-point ladder uses, for the same measured reason: the failures on this path
+/// are the ones a textbook 0.3–0.5 does not reach.
+const GAMMA_RESCUE_DAMPING: f64 = 0.9;
+const GAMMA_RESCUE_ITERATIONS: usize = 2000;
+
 pub fn run_gamma(
     molecule: &Molecule,
     params: &Pm3Parameters,
@@ -358,7 +365,21 @@ pub fn run_gamma(
         )));
     }
 
-    let state = scf_loop(
+    // **The same rescue rung the k-point path has**, which this path did not.
+    //
+    // `run_kpoints` retries a stalled SCF with damping and says so; `run_gamma` reported the
+    // failure and stopped, so an 80-atom framework supercell that needed nothing more than a
+    // gentler path simply could not be run — and every Γ consumer inherited that: the analytic
+    // Hessian, phonons, Born charges, the supercell force constants behind a phonon dispersion.
+    //
+    // Damping is admissible here for the reason it is there: it changes the path and not the
+    // fixed point, and `scf_loop` measures its convergence against the **undamped** step
+    // (`new_total.rms_difference(&p_total)`, taken before `damp_into`), so a damped run that
+    // converges has solved the equations that were asked for rather than a softened version.
+    //
+    // Smearing is *not* a second rung here. The Γ path fills by band index rather than through a
+    // chemical potential, so there is no occupation to smear and no certificate to check.
+    let state = match scf_loop(
         molecule,
         params,
         options,
@@ -366,7 +387,31 @@ pub fn run_gamma(
         n_alpha,
         n_beta,
         unrestricted,
-    )?;
+    ) {
+        Ok(state) => state,
+        Err(first @ Pm3Error::ScfNotConverged { .. }) => {
+            // An explicit choice is never second-guessed, exactly as on the k-point path.
+            if options.damping != 0.0 {
+                return Err(first);
+            }
+            let damped = Pm3Options {
+                damping: GAMMA_RESCUE_DAMPING,
+                max_scf: options.max_scf.max(GAMMA_RESCUE_ITERATIONS),
+                ..options.clone()
+            };
+            scf_loop(
+                molecule,
+                params,
+                &damped,
+                &setup,
+                n_alpha,
+                n_beta,
+                unrestricted,
+            )
+            .map_err(|_| first)?
+        }
+        Err(other) => return Err(other),
+    };
 
     // Classical corrections are post-SCF and lattice-summed once per geometry; they never enter
     // the Fock matrix, so they are added here and nowhere else. Keeping the single addition site
@@ -564,12 +609,26 @@ fn scf_loop(
     };
     let mut accelerator = accelerator;
 
+    // Where a periodic iteration's time goes, cumulative over the run. Three candidates, and
+    // reading the code does not settle which dominates: the Ewald field is a lattice sum, the
+    // Fock build is a serial loop over pairs, and the diagonalization is the `O(N³)` term.
+    // `examples/periodic_profile.rs` measures the whole; this splits it. Set `PM3_GAMMA_PROFILE=1`.
+    let profile = std::env::var_os("PM3_GAMMA_PROFILE").is_some();
+    let (mut t_field, mut t_fock, mut t_eigen) = (0.0f64, 0.0f64, 0.0f64);
+    let clock = std::time::Instant::now();
+    let mut since = clock.elapsed().as_secs_f64();
+
     for iteration in 1..=options.max_scf {
         iterations = iteration;
         let p_total = add(&p_alpha, &p_beta);
 
         // The electrons' own long-range field, from the total density.
         let electrons = electron_field(setup, &p_total)?;
+        if profile {
+            let now = clock.elapsed().as_secs_f64();
+            t_field += now - since;
+            since = now;
+        }
 
         let mut fock_alpha = build_periodic_fock(molecule, params, setup, &p_total, &p_alpha)?;
         add_site_potential(setup, &mut fock_alpha, &electrons);
@@ -580,6 +639,11 @@ fn scf_loop(
         } else {
             fock_alpha.clone()
         };
+        if profile {
+            let now = clock.elapsed().as_secs_f64();
+            t_fock += now - since;
+            since = now;
+        }
 
         // The energy the convergence test watches, evaluated *here* — at the current density,
         // with the Fock matrix that density produces, before any extrapolation touches it.
@@ -648,6 +712,12 @@ fn scf_loop(
             (new_alpha.clone(), energies_alpha.clone())
         };
 
+        if profile {
+            let now = clock.elapsed().as_secs_f64();
+            t_eigen += now - since;
+            since = now;
+        }
+
         let new_total = add(&new_alpha, &new_beta);
         let change = new_total.rms_difference(&p_total);
 
@@ -673,6 +743,42 @@ fn scf_loop(
         }
         last_energy = electronic;
         last_change = change;
+    }
+
+    if profile {
+        let total = t_field + t_fock + t_eigen;
+        let share = |t: f64| if total > 0.0 { 100.0 * t / total } else { 0.0 };
+        eprintln!(
+            "[gamma profile] {} atoms, {} AOs, {iterations} iterations, {:.3} s accounted for",
+            molecule.atoms.len(),
+            setup.basis.nao,
+            total,
+        );
+        eprintln!(
+            "  Ewald field      {:>8.3} s  {:>5.1}%   ({:.2} ms/iteration)",
+            t_field,
+            share(t_field),
+            1000.0 * t_field / iterations.max(1) as f64,
+        );
+        // Which half of the lattice sum, since that is where nearly all of it is. Cumulative
+        // over the process rather than over this call, so read the differences between runs.
+        let (real, reciprocal, corrections) = crate::pbc::ewald::profile_snapshot();
+        eprintln!(
+            "    real space     {real:>8.3} s | reciprocal {reciprocal:>8.3} s | \
+             corrections {corrections:>8.3} s   (process totals)"
+        );
+        eprintln!(
+            "  Fock build       {:>8.3} s  {:>5.1}%   ({:.2} ms/iteration)",
+            t_fock,
+            share(t_fock),
+            1000.0 * t_fock / iterations.max(1) as f64,
+        );
+        eprintln!(
+            "  diagonalization  {:>8.3} s  {:>5.1}%   ({:.2} ms/iteration)",
+            t_eigen,
+            share(t_eigen),
+            1000.0 * t_eigen / iterations.max(1) as f64,
+        );
     }
 
     if !converged {
@@ -703,6 +809,7 @@ fn scf_loop(
         return Err(Pm3Error::ScfNotConverged {
             iterations,
             error: last_change,
+            diagnosis: None,
         });
     }
 
@@ -758,7 +865,7 @@ fn scf_loop(
 const DIIS_DEPTH: usize = 8;
 
 /// Commutator norm below which damping is switched off and CDIIS runs unassisted.
-const DAMPING_HANDOVER: f64 = 1.0e-2;
+pub(crate) const DAMPING_HANDOVER: f64 = 1.0e-2;
 
 /// Largest `Σ|c_i|` accepted from the CDIIS solve.
 ///

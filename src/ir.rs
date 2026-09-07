@@ -17,7 +17,7 @@
 //!
 //! so the expensive object can be either one. The **field** side has three perturbations
 //! whatever the molecule is, and the nuclear side needs only `G^R` — the derivative Fock, which
-//! [`crate::hessian::skeleton_fock_ov`] already builds without any coupled-perturbed solve at
+//! `hessian::skeleton_fock_ov` already builds without any coupled-perturbed solve at
 //! all. So the whole `3 × 3N` tensor costs three solves, and the cost stops growing with the
 //! system.
 //!
@@ -309,7 +309,17 @@ pub fn ir_spectrum(
             // rotations do not appear as absorption.
             let derivative: f64 = (0..ndof)
                 .map(|dof| {
-                    derivatives[(axis, dof)] * projector[(dof, mode)] / masses[dof / 3].sqrt()
+                    // A massless site contributes nothing rather than infinity. MOPAC's `+`
+                    // (Z = 104) and `--` (Z = 106) point charges have a tabulated mass of exactly
+                    // zero and are accepted from a plain XYZ line; the three sibling
+                    // mass-weightings have always guarded this and only here was it missing, so
+                    // an infrared spectrum of a system containing one came back as `NaN`.
+                    let root = masses[dof / 3].sqrt();
+                    if root > 0.0 {
+                        derivatives[(axis, dof)] * projector[(dof, mode)] / root
+                    } else {
+                        0.0
+                    }
                 })
                 .sum();
             sum += derivative * derivative;
@@ -331,81 +341,17 @@ pub fn ir_spectrum(
 /// Six directions (five for a linear molecule) carry no vibration, and `∂μ/∂R` is generally
 /// non-zero along all of them: `Σ_A ∂μ_β/∂R_{Aα} = Q δ_αβ` for a charged molecule, and a
 /// permanent dipole rotates. Leaving them in puts absorption on modes that have none.
+/// The subspace itself is [`crate::rigid`]'s, shared with the frequency path rather than built a
+/// second time here. The two carried separate copies of the same Gram–Schmidt, which is how the
+/// massless-site guard came to exist in one of them and not the other.
 fn internal_projector(molecule: &Molecule, masses: &[f64], modes: &Matrix) -> Matrix {
-    let nat = molecule.atoms.len();
-    let ndof = 3 * nat;
-
-    // Build the six mass-weighted rigid-body vectors, orthonormalize them, and subtract their
-    // projection from each mode.
-    let centre = {
-        let mut total = 0.0;
-        let mut moment = [0.0; 3];
-        for (index, atom) in molecule.atoms.iter().enumerate() {
-            let m = masses[index];
-            total += m;
-            for (slot, value) in moment.iter_mut().zip(atom.position.to_array()) {
-                *slot += m * value;
-            }
-        }
-        moment.map(|v| if total > 0.0 { v / total } else { 0.0 })
-    };
-
-    let mut rigid: Vec<Vec<f64>> = Vec::with_capacity(6);
-    for axis in 0..3 {
-        let mut vector = vec![0.0; ndof];
-        for atom in 0..nat {
-            vector[3 * atom + axis] = masses[atom].sqrt();
-        }
-        rigid.push(vector);
-    }
-    for axis in 0..3 {
-        let mut vector = vec![0.0; ndof];
-        for atom in 0..nat {
-            let r = molecule.atoms[atom].position.to_array();
-            let d = [r[0] - centre[0], r[1] - centre[1], r[2] - centre[2]];
-            // The rotation generator about `axis`: `e_axis × d`.
-            let cross = match axis {
-                0 => [0.0, -d[2], d[1]],
-                1 => [d[2], 0.0, -d[0]],
-                _ => [-d[1], d[0], 0.0],
-            };
-            let root = masses[atom].sqrt();
-            for (component, value) in cross.iter().enumerate() {
-                vector[3 * atom + component] = root * value;
-            }
-        }
-        rigid.push(vector);
-    }
-
-    // Gram–Schmidt, dropping directions that are already spanned — a linear molecule has only
-    // two rotations, and an atom none, so the count is discovered rather than assumed.
-    let mut basis: Vec<Vec<f64>> = Vec::new();
-    for mut candidate in rigid {
-        for kept in &basis {
-            let overlap: f64 = candidate.iter().zip(kept).map(|(a, b)| a * b).sum();
-            for (value, base) in candidate.iter_mut().zip(kept) {
-                *value -= overlap * base;
-            }
-        }
-        let norm: f64 = candidate.iter().map(|v| v * v).sum::<f64>().sqrt();
-        if norm > 1.0e-6 {
-            for value in candidate.iter_mut() {
-                *value /= norm;
-            }
-            basis.push(candidate);
-        }
-    }
-
-    let mut out = modes.clone();
-    for mode in 0..ndof {
-        for kept in &basis {
-            let overlap: f64 = (0..ndof).map(|row| kept[row] * out[(row, mode)]).sum();
-            for (row, base) in kept.iter().enumerate() {
-                out[(row, mode)] -= overlap * base;
-            }
-        }
-    }
-    out
+    let positions: Vec<crate::math::Vec3> = molecule.atoms.iter().map(|a| a.position).collect();
+    let basis = crate::rigid::rigid_body_basis(
+        &positions,
+        masses,
+        crate::rigid::RigidMotions::TranslationsAndRotations,
+    );
+    crate::rigid::project_columns(&basis, modes)
 }
 
 #[cfg(test)]

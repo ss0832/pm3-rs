@@ -192,7 +192,7 @@ pub(crate) fn has_d_atom(molecule: &Molecule, params: &Pm3Parameters) -> Result<
 
 /// Fully closed-form Hellmann–Feynman gradient, robust to axis-aligned d/sparkle geometries.
 ///
-/// Thin wrapper over [`closed_form_gradient_core`]. The d/sparkle two-center rotation is singular
+/// Thin wrapper over `closed_form_gradient_core`. The d/sparkle two-center rotation is singular
 /// for a bond on the global z-axis, where the degenerate branch zeroes the rotation derivatives —
 /// so a d-pair sitting on `+z` in an **asymmetric** environment would get a wrong transverse
 /// force (≈0.2 eV/Bohr in testing). Because the energy is rotationally invariant, we detect such a
@@ -242,7 +242,7 @@ fn closed_form_gradient_core(
         // Open-shell: spin-resolved closed-form fixed-density (Hellmann–Feynman) gradient.
         let energy_ev = scf.total_ev;
         let mut gradient = fixed_density_gradient_uhf(molecule, params, &scf)?;
-        add_correction_gradient(molecule, options.variant, &mut gradient);
+        add_correction_gradient(molecule, options.variant, options.mmok, &mut gradient);
         add_field_gradient(options, &scf, &mut gradient);
         let forces: Vec<Vec3> = gradient.iter().map(|g| *g * -1.0).collect();
         let max_gradient = gradient
@@ -259,7 +259,7 @@ fn closed_form_gradient_core(
     }
     let energy_ev = scf.total_ev;
     let mut gradient = fixed_density_gradient(molecule, params, &scf.density)?;
-    add_correction_gradient(molecule, options.variant, &mut gradient);
+    add_correction_gradient(molecule, options.variant, options.mmok, &mut gradient);
     add_field_gradient(options, &scf, &mut gradient);
     let forces: Vec<Vec3> = gradient.iter().map(|g| *g * -1.0).collect();
     let max_gradient = gradient
@@ -324,9 +324,10 @@ pub fn fixed_density_gradient(
 pub(crate) fn add_correction_gradient(
     molecule: &Molecule,
     variant: crate::corrections::Variant,
+    mmok: bool,
     gradient: &mut [Vec3],
 ) {
-    if variant == crate::corrections::Variant::Pm3 {
+    if variant == crate::corrections::Variant::Pm3 && !mmok {
         return;
     }
     let (numbers, p0) = crate::corrections::geometry_f64(molecule);
@@ -347,7 +348,9 @@ pub(crate) fn add_correction_gradient(
             Dual::var(p0[a][2], 2),
         ];
         // ∂E_corr/∂R_a (eV/Bohr), since positions are in Bohr.
-        let e = crate::corrections::correction_energy_g::<Dual>(&numbers, &pos, variant);
+        let e = crate::corrections::correction_energy_with_mmok_g::<Dual>(
+            &numbers, &pos, variant, mmok,
+        );
         gradient[a] += Vec3::new(e.d[0], e.d[1], e.d[2]);
     }
 }

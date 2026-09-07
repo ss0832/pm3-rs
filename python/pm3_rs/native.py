@@ -145,14 +145,80 @@ def optimize(
     reference: str = "auto",
     method: str = "pm3",
     field=None,
+    max_steps: int = 200,
+    force_tol=None,
 ) -> dict:
     """L-BFGS geometry optimization on the analytic PM3 gradient.
 
-    Coordinates in **Angstrom**. Returns ``positions_angstrom``,
-    ``energy_hartree``, ``heat_of_formation_kcal``, ``converged``, ``iterations``.
+    Coordinates in **Angstrom**. Returns ``positions_angstrom``, ``energy_hartree``,
+    ``energy_ev``, ``heat_of_formation_kcal``, ``converged`` and ``iterations``.
+
+    ``positions`` and ``steps`` are aliases for ``positions_angstrom`` and
+    ``iterations``, so that this function and :func:`relax` -- the same operation on a
+    periodic cell -- answer to the same names. Through 0.2.3 the two returned disjoint
+    key sets and ``optimize(...)["energy_ev"]`` raised :exc:`KeyError` even though every
+    other function in this module returns that key.
+
+    ``force_tol`` is eV/Angstrom, as in :func:`relax` and
+    :func:`divide_and_conquer_optimize`. It defaults to ``None``, meaning the optimizer's
+    own 1e-3 eV/Bohr, rather than to those functions' 0.02 eV/Angstrom: the two differ by
+    a factor of ten, and exposing a knob is not a reason to move the answer for callers
+    who never touch it.
     """
     n, p = _as_lists(numbers, positions)
     return _native.optimize(
+        n,
+        p,
+        float(charge),
+        int(multiplicity),
+        str(reference),
+        str(method),
+        None if field is None else [float(v) for v in field],
+        int(max_steps),
+        None if force_tol is None else float(force_tol),
+    )
+
+
+def orbitals(
+    numbers: Sequence[int],
+    positions,
+    charge: float = 0.0,
+    multiplicity: int = 1,
+    reference: str = "auto",
+    method: str = "pm3",
+    field=None,
+) -> dict:
+    """Molecular orbital energies, coefficients and occupations.
+
+    Coordinates in **Angstrom**. All of this has been on the Rust ``Pm3Result`` since
+    the beginning and none of it was reachable from Python: :func:`single_point` gave
+    ``homo_ev`` and ``lumo_ev`` and nothing else, so the only way to see a spectrum or
+    a coefficient was to write a Molden file and parse it back.
+
+    ``mo_coefficients`` is ``nao x nmo`` with **AOs down the rows and MOs across the
+    columns**, so ``mo_coefficients[i][m]`` is the weight of atomic orbital ``i`` in
+    molecular orbital ``m``. ``ao_labels`` names the rows -- ``(atom index, element
+    symbol, orbital)`` with orbital one of ``s``, ``px``, ``py``, ``pz`` -- because
+    otherwise a coefficient is a number whose meaning the caller has to reconstruct
+    from the element table, and getting that wrong is silent.
+
+    Energies are ascending, so the occupied orbitals are the leading ``n_occupied``.
+    ``homo_index`` and ``lumo_index`` are ``None`` rather than an index when a shell is
+    empty or full, since ``0`` and ``nao`` would both read as a real frontier.
+
+    ``homo_ev``, ``lumo_ev`` and ``gap_ev`` are taken across **both** spin channels: a
+    radical's beta LUMO sits below its alpha one, so the alpha spectrum alone gives the
+    wrong frontier.
+
+    Keys: ``mo_energies_ev``, ``mo_energies_hartree``, ``mo_coefficients``,
+    ``occupations``, ``n_occupied``, ``homo_index``, ``lumo_index``, ``homo_ev``,
+    ``lumo_ev``, ``gap_ev``, ``ao_labels``, ``unrestricted``, ``n_beta``, and the beta
+    set ``mo_energies_beta_ev``, ``mo_energies_beta_hartree``, ``mo_coefficients_beta``,
+    ``occupations_beta`` -- present and ``None`` for a restricted run, so the key set
+    does not depend on the shell.
+    """
+    n, p = _as_lists(numbers, positions)
+    return _native.orbitals(
         n,
         p,
         float(charge),
@@ -171,6 +237,7 @@ def frequencies(
     reference: str = "auto",
     method: str = "pm3",
     field=None,
+    cphf_max_iter=None,
 ) -> dict:
     """Harmonic vibrational frequencies from the analytic (CPHF) Hessian.
 
@@ -197,6 +264,7 @@ def frequencies(
         str(reference),
         str(method),
         None if field is None else [float(v) for v in field],
+            cphf_max_iter,
     )
 
 
@@ -208,6 +276,7 @@ def hessian(
     reference: str = "auto",
     method: str = "pm3",
     field=None,
+    cphf_max_iter=None,
 ) -> dict:
     """Analytic Cartesian Hessian from coupled-perturbed SCF (+ the classical
     D3/H4/X second derivatives for the correction variants).
@@ -224,6 +293,7 @@ def hessian(
         str(reference),
         str(method),
         None if field is None else [float(v) for v in field],
+            cphf_max_iter,
     )
 
 
@@ -316,6 +386,33 @@ def periodic_single_point(
     lies inside the exchange range. A cell one Bohr too narrow converges cleanly
     to an answer wrong by tens of eV. Positive is fine; negative is not. See
     ``docs/pbc.md``.
+
+    Keys: ``energy_ev``, ``energy_hartree``, ``electronic_ev``, ``core_ev``,
+    ``correction_ev``, ``ewald_ev``, ``heat_of_formation_kcal``, ``charges``,
+    ``converged``, ``n_kpoints``, ``homo_ev``, ``lumo_ev``, ``band_gap_ev``,
+    ``fermi_ev``, ``gamma_margin_bohr``, ``entropy_ts_ev``, ``free_energy_ev``,
+    ``rescued_by``, ``charge_swing``.
+
+    ``charge_swing`` is how far any atom's electron population moved *during* the
+    iteration, in electrons. Small for a well-behaved SCF. A large value says the density
+    passed through qualitatively different arrangements before settling -- charge
+    sloshing -- and a converged answer reached that way may have landed on a spurious
+    self-consistent branch.
+
+    Rocksalt NaCl is the case that makes this concrete. On a ``2x2x2`` mesh it converges,
+    with ``converged`` true and no error, to a state carrying **-2.10 electrons of charge
+    on the sodium**; every mesh from ``3x3x3`` to ``7x7x7`` puts +0.16 to +0.24 there and
+    agrees on the energy to 0.06 eV. The even mesh swings 1.44 electrons on the way,
+    against 0.29 for the odd one. Nothing in the energy or the residual says the answer is
+    nonsense; this does.
+
+    ``rescued_by`` is ``None`` almost always. It is a sentence when the SCF ran out at
+    the settings you asked for and a retry converged it -- currently only ever with Fermi
+    smearing, and only kept when the occupations came out integral, which proves the
+    smeared answer is the one the strict filling would have reached. **Read it when it is
+    set** and corroborate the energy against another k-mesh: a convergence aid can find a
+    different self-consistent solution, and on rocksalt NaCl the difference between two of
+    them is 37 eV.
     """
     numbers, positions = _as_lists(numbers, positions)
     return _native.periodic_single_point(
@@ -358,6 +455,10 @@ def periodic_forces(
     this function converged a strictly-filled SCF while its sibling converged a
     smeared one, so an ASE calculator built with a smearing took its energy and
     forces from one self-consistent solution and its charges from another.
+
+    Keys: ``forces_ev_per_angstrom``, ``stress_ev_per_angstrom3``, ``energy_ev``,
+    ``energy_hartree``, ``charges``, ``heat_of_formation_kcal``,
+    ``gamma_margin_bohr``, ``entropy_ts_ev``, ``free_energy_ev``, ``converged``.
     """
     numbers, positions = _as_lists(numbers, positions)
     return _native.periodic_forces(
@@ -388,6 +489,7 @@ def phonons(
     kpts=None,
     smearing_ev: float = 0.0,
     lo_to_direction=None,
+    cphf_max_iter=None,
 ) -> dict:
     """Phonon frequencies (cm^-1).
 
@@ -413,6 +515,24 @@ def phonons(
     a slab's macroscopic field vanishes linearly in ``q`` and a chain's as
     ``q^2 ln(1/q)``, so neither has a splitting to add. The Born charges and
     ``eps_inf`` it needs are computed on the way.
+
+    **Polarization vectors** come back with the frequencies. At Gamma they are
+    ``modes``, real, one mode per row: ``modes[m][3 * a + i]`` is the
+    mass-weighted displacement of atom ``a`` along axis ``i`` in mode ``m``, so
+    the Cartesian displacement is that divided by ``sqrt(masses[a])``. At a
+    wavevector they are complex -- the atoms in a cell move with a relative phase
+    -- and arrive as ``modes_real`` and ``modes_imag`` with the same indexing.
+    Dropping the imaginary part would silently turn a travelling wave into a
+    standing one, which is why both halves are returned rather than a magnitude.
+
+    A frequency says how fast a mode vibrates; the eigenvector says what moves in
+    it, and it is what separates an optical branch from an acoustic one or shows
+    which sublattice a soft mode belongs to. It was being computed and discarded.
+
+    Keys, Gamma: ``frequencies_cm``, ``modes``, ``masses``,
+    ``acoustic_residual_cm``, ``energy_ev``.
+    At a wavevector: ``frequencies_cm``, ``modes_real``, ``modes_imag``,
+    ``masses``, ``hermitian_defect``, ``q``, ``lo_to_direction``.
     """
     numbers, positions = _as_lists(numbers, positions)
     return _native.phonons(
@@ -429,6 +549,7 @@ def phonons(
         float(smearing_ev),
         None if lo_to_direction is None
         else [float(v) for v in np.asarray(lo_to_direction).reshape(-1)],
+            cphf_max_iter,
     )
 
 
@@ -476,9 +597,11 @@ def divide_and_conquer(
     Returns
     -------
     dict
-        ``dropped_pairs`` and ``largest_subsystem`` say what the partitioning
-        traded: how many density elements were set to zero, and how big the
-        problems actually solved were.
+        ``energy_ev``, ``energy_hartree``, ``heat_of_formation_kcal``,
+        ``charges``, ``converged``, ``fermi_ev``, ``n_subsystems``, plus
+        ``dropped_pairs`` and ``largest_subsystem``, which say what the
+        partitioning traded: how many density elements were set to zero, and
+        how big the problems actually solved were.
     """
     numbers, positions = _as_lists(numbers, positions)
     return _native.divide_and_conquer(
@@ -495,6 +618,65 @@ def divide_and_conquer(
         smearing_ev,
         long_range_cutoff,
         None if field is None else [float(v) for v in np.asarray(field).reshape(-1)],
+    )
+
+
+def divide_and_conquer_optimize(
+    numbers: Sequence[int],
+    positions,
+    charge: float = 0.0,
+    multiplicity: int = 1,
+    reference: str = "auto",
+    method: str = "pm3",
+    core_radius: float = 3.2,
+    buffer_radius: float = 4.8,
+    smearing_ev: float = 0.1,
+    long_range_cutoff=None,
+    field=None,
+    max_steps: int = 200,
+    force_tol: float = 0.02,
+) -> dict:
+    """Geometry optimization on the divide-and-conquer gradient.
+
+    The same L-BFGS as :func:`optimize`, driven by
+    :func:`divide_and_conquer_forces` instead of a full diagonalization -- for the
+    case the method exists for, where a full diagonalization per line-search trial
+    is not affordable.
+
+    Molecular only. The periodic partitioned path has no cell gradient, so a cell
+    would have to be held fixed silently; :func:`relax` is the periodic optimizer.
+
+    Arguments are :func:`divide_and_conquer`'s, plus ``max_steps`` and
+    ``force_tol`` (eV/Angstrom) from :func:`optimize`.
+
+    Returns
+    -------
+    dict
+        ``positions_angstrom`` (and ``positions``), ``energy_ev``,
+        ``energy_hartree``, ``heat_of_formation_kcal``, ``converged``,
+        ``iterations`` (and ``steps``), ``n_subsystems``.
+
+    The caveat on :func:`divide_and_conquer_forces` carries through and gets
+    worse here: a partitioned gradient is not the exact derivative of the
+    partitioned energy, so the geometry this converges to is the buffer's
+    minimum, not the method's. Widen ``buffer_radius`` and re-run before
+    believing a structure.
+    """
+    numbers, positions = _as_lists(numbers, positions)
+    return _native.divide_and_conquer_optimize(
+        numbers,
+        positions,
+        charge,
+        multiplicity,
+        reference,
+        method,
+        core_radius,
+        buffer_radius,
+        smearing_ev,
+        long_range_cutoff,
+        None if field is None else [float(v) for v in np.asarray(field).reshape(-1)],
+        int(max_steps),
+        float(force_tol),
     )
 
 
@@ -522,7 +704,8 @@ def divide_and_conquer_forces(
 
     Arguments are :func:`divide_and_conquer`'s. Returns
     ``forces_ev_per_angstrom``, ``stress_ev_per_angstrom3`` (``None`` without a
-    cell) and the same energy and charge keys.
+    cell) and the same energy and charge keys: ``energy_ev``, ``energy_hartree``,
+    ``heat_of_formation_kcal``, ``charges``, ``converged``, ``n_subsystems``.
 
     One caveat, stated rather than hidden: a divide-and-conquer density is not
     variational -- it is assembled, not minimized -- so the usual argument that
@@ -558,6 +741,7 @@ def born_charges(
     reference: str = "auto",
     method: str = "pm3",
     enforce: bool = False,
+    cphf_max_iter=None,
 ) -> dict:
     """Born effective charges: one ``3 x 3`` tensor per atom, in elementary charges.
 
@@ -580,6 +764,8 @@ def born_charges(
     an absent one, because the static charges of a neutral cell already sum to
     zero. The crate's own tests therefore also check ``Z*`` against a central
     difference of the cell dipole.
+
+    Keys: ``born_charges``, ``sum_rule_residual``, ``gamma_margin_bohr``.
     """
     numbers, positions = _as_lists(numbers, positions)
     return _native.born_charges(
@@ -592,6 +778,7 @@ def born_charges(
         str(reference),
         str(method),
         bool(enforce),
+            cphf_max_iter,
     )
 
 
@@ -605,6 +792,7 @@ def dielectric(
     reference: str = "auto",
     method: str = "pm3",
     include_ionic: bool = False,
+    cphf_max_iter=None,
 ) -> dict:
     """Electronic polarizability and, in 3D, the dielectric tensor.
 
@@ -636,6 +824,9 @@ def dielectric(
     formation, geometries, dipoles and ionization potentials, not against
     solid-state dielectric response. These are the correct tensors *of this
     model*, which is a different claim from agreement with a measurement.
+
+    Keys: ``polarizability``, ``epsilon``, ``gamma_margin_bohr``; with
+    ``include_ionic=True`` also ``electronic``, ``ionic`` and ``skipped_modes``.
     """
     numbers, positions = _as_lists(numbers, positions)
     return _native.dielectric(
@@ -648,6 +839,7 @@ def dielectric(
         str(reference),
         str(method),
         bool(include_ionic),
+            cphf_max_iter,
     )
 
 
@@ -685,6 +877,9 @@ def berry_polarization(
     same ``Z*`` through overlaps between neighbouring k-points, with no response
     equation anywhere in it. The two differ by the intra-atomic ``s``-``p``
     moment the phase cannot carry, which places every orbital at its atom.
+
+    Keys: ``total``, ``electronic``, ``ionic``, ``phase``, ``quantum``,
+    ``string_length``, ``gamma_margin_bohr``.
     """
     numbers, positions = _as_lists(numbers, positions)
     return _native.berry_polarization(
@@ -729,6 +924,9 @@ def phonon_bands(
     what the truncation threw away, and flattening it unseen would hide force
     constants that are simply wrong. Pass ``enforce_asr=True`` once you have
     looked at it.
+
+    Keys: ``q``, ``frequencies_cm``, ``supercell``, ``acoustic_sum_rule_residual``,
+    ``gamma_margin_bohr``.
     """
     numbers, positions = _as_lists(numbers, positions)
     return _native.phonon_bands(
@@ -796,6 +994,11 @@ def finite_field(
     differencing them at a field small enough that the branch cannot have
     changed, as ``alpha = Omega dP/dE`` does, rather than reading one in
     isolation.
+
+    Keys: ``energy_ev`` (also as ``energy``, this function's older name for it),
+    ``enthalpy_ev``, ``polarization``, ``electronic_polarization``,
+    ``ionic_polarization``, ``resolved``, ``phase``, ``field``, ``converged``,
+    ``iterations``, ``gamma_margin_bohr``.
     """
     numbers, positions = _as_lists(numbers, positions)
     return _native.finite_field(
@@ -823,18 +1026,31 @@ def molden(
     reference: str = "auto",
     method: str = "pm3",
     field=None,
+    basis: str = "gto",
 ) -> str:
     """The converged wavefunction as a Molden document (a string).
 
     Coordinates in **Angstrom**. Returns the file's text rather than writing it,
     so the caller chooses the destination.
 
-    The Slater orbitals are written as Gaussian expansions, because almost no
-    viewer reads Molden's ``[STO]`` section. Note what is being drawn: PM3
-    assumes its AO basis is orthonormal, and the real Slater basis is not, so
-    these are the conventional semiempirical orbitals -- the same ones MOPAC's
-    ``VECTORS`` and ``GRAPHF`` produce -- not the orbitals of the Slater basis
-    itself.
+    ``basis`` selects the section the basis is written into:
+
+    ``"gto"`` (default)
+        The Slater orbitals as even-tempered Gaussian expansions, because almost
+        no viewer reads Molden's ``[STO]`` section. The fit's overlap defect is
+        at most 3e-5.
+    ``"sto"``
+        The Slater exponents PM3 actually uses, in ``[STO]``. Exact rather than
+        fitted, and readable by fewer viewers -- for the ones that do, and for
+        anyone who wants the model's own exponents rather than a fit to them.
+
+    The two differ only in the basis section: the ``[MO]`` block is the same
+    wavefunction either way, and a test asserts it.
+
+    Note what is being drawn, in both cases: PM3 assumes its AO basis is
+    orthonormal, and the real Slater basis is not, so these are the conventional
+    semiempirical orbitals -- the same ones MOPAC's ``VECTORS`` and ``GRAPHF``
+    produce -- not the orbitals of the Slater basis itself.
     """
     n, p = _as_lists(numbers, positions)
     return _native.molden(
@@ -845,6 +1061,7 @@ def molden(
         str(reference),
         str(method),
         None if field is None else [float(v) for v in field],
+        str(basis),
     )
 
 
@@ -856,6 +1073,7 @@ def ir_spectrum(
     reference: str = "auto",
     method: str = "pm3",
     field=None,
+    cphf_max_iter=None,
 ) -> dict:
     """Infrared spectrum from the analytic dipole derivatives.
 
@@ -863,7 +1081,7 @@ def ir_spectrum(
     **Angstrom**. Returns ``frequencies_cm`` (as :func:`frequencies`),
     ``intensities_km_per_mol`` aligned with them, and
     ``dipole_derivatives_e`` -- the raw ``3 x 3N`` tensor in elementary charges,
-    row = dipole axis, column = 3*atom + axis.
+    row = dipole axis, column = 3*atom + axis, and ``ndof``.
 
     The tensor costs three coupled-perturbed solves regardless of system size,
     not one per nuclear coordinate; see the Rust module for why.
@@ -877,6 +1095,7 @@ def ir_spectrum(
         str(reference),
         str(method),
         None if field is None else [float(v) for v in field],
+            cphf_max_iter,
     )
 
 
@@ -1039,7 +1258,12 @@ def relax(
     having no strain to relax against.
 
     Returns ``positions`` and ``cell`` in Angstrom, plus ``energy_ev``,
-    ``converged`` and ``steps``.
+    ``energy_hartree``, ``heat_of_formation_kcal``, ``converged`` and ``steps``.
+
+    ``positions_angstrom`` and ``iterations`` are aliases for ``positions`` and
+    ``steps``, so that this function and :func:`optimize` -- the same operation on a
+    molecule -- answer to the same names. Through 0.2.3 the two returned disjoint key
+    sets, and the heat of formation was missing here entirely.
     """
     numbers, positions = _as_lists(numbers, positions)
     return _native.relax(

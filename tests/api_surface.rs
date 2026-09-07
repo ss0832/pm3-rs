@@ -571,17 +571,46 @@ fn documented_hessian_and_frequency_surface() {
     for pair in modes.frequencies_cm.windows(2) {
         assert!(pair[0] <= pair[1], "frequencies not ascending: {pair:?}");
     }
-    // At a minimum: 6 near-zero translation/rotation modes, 3 real vibrations
-    // in the physical range for water.
-    let vibrations = &modes.frequencies_cm[6..];
+    // At a minimum: 6 translation/rotation modes and 3 real vibrations in water's range.
+    //
+    // Six because the geometry says so — `n_rigid` is the rank found by orthonormalizing the
+    // rigid-body generators, not a constant — and **exactly** zero because they are projected out
+    // rather than recognised afterwards for being small. This used to read `f.abs() < 50.0` here,
+    // `< 100.0` in `tests/test_python_api.py` and `< 300.0` in `src/hessian.rs`: three bounds on
+    // one quantity, which is what a threshold nobody can derive looks like from the outside.
+    // `== 0.0` rather than `< 1e-6`, and that is safe rather than lucky: the eigenvalues along
+    // the projected subspace are **assigned** zero, not merely computed to be small. The
+    // projection leaves them at ±1e-15, `rigid_mode_indices` says which they are — a count taken
+    // from the geometry applied to a ranking, with no magnitude in it — and they are then set to
+    // `0.0`. `signed_wavenumber(0.0)` is `521.47 * (0.0).sqrt()`, exactly `0.0` under IEEE-754 on
+    // every platform. A tolerance here would be asserting less than is true and would let a
+    // regression that reintroduces the noise pass.
+    //
+    // What is *not* assumed is where the zeros land. They are the lowest modes only at a
+    // minimum; an imaginary mode sorts below them. So this counts them rather than slicing.
+    assert_eq!(modes.n_rigid, 6, "a bent triatomic has three of each");
+    assert_eq!(
+        modes.frequencies_cm.iter().filter(|f| **f == 0.0).count(),
+        modes.n_rigid,
+        "expected exactly {} exact zeros, got {:?}",
+        modes.n_rigid,
+        modes.frequencies_cm
+    );
+    let vibrations = &modes.frequencies_cm[modes.n_rigid..];
+    assert!(
+        vibrations.iter().all(|f| *f != 0.0),
+        "a vibration came out exactly zero, so the count above is measuring the wrong modes"
+    );
     assert!(
         vibrations.iter().all(|f| *f > 1000.0 && *f < 4200.0),
         "water vibrations out of range: {vibrations:?}"
     );
+    // The number the projection replaced is still reported, as the diagnostic it always was: how
+    // far from zero the Hessian put those directions before they were removed.
     assert!(
-        modes.frequencies_cm[..6].iter().all(|f| f.abs() < 50.0),
-        "translations/rotations not near zero: {:?}",
-        &modes.frequencies_cm[..6]
+        modes.rigid_residual_cm > 0.0 && modes.rigid_residual_cm < 50.0,
+        "the pre-projection residual should be small but non-zero, got {}",
+        modes.rigid_residual_cm
     );
     // "negative = imaginary": the sign convention is carried from the eigenvalue.
     for (frequency, eigenvalue) in modes.frequencies_cm.iter().zip(&modes.eigenvalues) {
@@ -590,6 +619,44 @@ fn documented_hessian_and_frequency_surface() {
             eigenvalue.is_sign_negative(),
             "sign convention broken"
         );
+    }
+}
+
+/// The Hessian handed back is the **raw** second derivative, with nothing imposed on it.
+///
+/// The projection that produces the frequencies is applied to a mass-weighted copy. A caller
+/// doing its own analysis — a thermochemistry code, a transition-state search, a comparison
+/// against another program's Hessian — needs the unmodified matrix, and would have no way to
+/// recover it if the rigid-body subspace had been removed on the way out.
+#[test]
+fn the_reported_hessian_is_the_unmodified_analytic_one() {
+    use pm3_rs::{analytic_hessian, vibrational_analysis, Molecule, Pm3Options, Pm3Parameters};
+
+    let mol = Molecule::from_xyz_str(WATER_XYZ, 0.0).unwrap();
+    let params = Pm3Parameters::standard().unwrap();
+    let options = Pm3Options::default();
+
+    let raw = analytic_hessian(&mol, &params, &options, 1.0e-3).unwrap();
+    let modes = vibrational_analysis(&mol, &params, &options, 1.0e-3).unwrap();
+
+    for i in 0..raw.rows {
+        for j in 0..raw.cols {
+            assert_eq!(
+                modes.hessian[(i, j)],
+                raw[(i, j)],
+                "VibrationalModes::hessian differs from analytic_hessian at ({i}, {j})"
+            );
+        }
+    }
+    // And it is symmetric, which a one-sided sum-rule correction would have broken.
+    for i in 0..raw.rows {
+        for j in 0..i {
+            assert_eq!(
+                modes.hessian[(i, j)],
+                modes.hessian[(j, i)],
+                "the reported Hessian is not symmetric at ({i}, {j})"
+            );
+        }
     }
 }
 

@@ -109,12 +109,43 @@ fn add_transpose_in_place(matrix: &mut Matrix) {
 /// `sqrt(eV / (Å²·amu))` → cm⁻¹ (standard vibrational conversion; 1 unit = 521.47 cm⁻¹).
 pub const SQRT_EV_PER_ANG2_AMU_TO_CM: f64 = 521.470_9;
 
+/// A mass-weighted eigenvalue as a wavenumber, negative for an imaginary frequency.
+///
+/// The sign is carried rather than the magnitude taken: a negative eigenvalue is a saddle point
+/// or an unconverged calculation, and `|ω|` would hide which.
+pub(crate) fn signed_wavenumber(eigenvalue: f64) -> f64 {
+    if eigenvalue >= 0.0 {
+        SQRT_EV_PER_ANG2_AMU_TO_CM * eigenvalue.sqrt()
+    } else {
+        -SQRT_EV_PER_ANG2_AMU_TO_CM * (-eigenvalue).sqrt()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct VibrationalModes {
     /// Cartesian Hessian (eV/Bohr²), symmetric, size `3N × 3N`.
+    ///
+    /// The **unprojected** second derivative, which is what a caller wanting to do its own
+    /// analysis needs. The rigid-body projection below is applied to the mass-weighted copy on
+    /// the way to the frequencies and does not touch this.
     pub hessian: Matrix,
     /// Harmonic frequencies (cm⁻¹), ascending; negative = imaginary (saddle/unconverged).
+    ///
+    /// Always `3N` long. The first [`Self::n_rigid`] of them are **exactly** `0.0`: translations
+    /// and rotations are projected out of the mass-weighted Hessian before it is diagonalized
+    /// (see [`crate::rigid`]), so those directions are empty rather than merely small. Nothing
+    /// here classifies a mode by being below some number of wavenumbers, which is what would
+    /// misread a soft mode.
     pub frequencies_cm: Vec<f64>,
+    /// How many directions were projected out: six for a molecule, five if it is linear, three
+    /// for a single atom. Discovered from the geometry, not assumed.
+    pub n_rigid: usize,
+    /// The largest wavenumber the rigid-body directions carried **before** projection.
+    ///
+    /// Zero in exact arithmetic, so this measures the quality of the Hessian and of the geometry
+    /// it was taken at — a large value means the structure is not a stationary point or the SCF
+    /// was too loose. Reported rather than used: nothing branches on it.
+    pub rigid_residual_cm: f64,
     /// Mass-weighted eigenvalues (eV/(Å²·amu)).
     pub eigenvalues: Vec<f64>,
     /// Normal modes as the **columns** of a `3N × 3N` matrix, in **mass-weighted** coordinates
@@ -152,12 +183,16 @@ pub(crate) fn tighten_scf_for_hessian(options: &Pm3Options) -> Pm3Options {
 /// Each Dual2 tracks a 3-vector, so the diagonal 3×3 atom blocks come from one evaluation per
 /// atom (seed that atom's `x,y,z`), and each off-diagonal element from an evaluation seeding one
 /// coordinate of atom `a` and one of atom `b` — exact, `O(N²)` cheap classical evaluations.
-fn correction_hessian(molecule: &Molecule, variant: crate::corrections::Variant) -> Matrix {
+fn correction_hessian(
+    molecule: &Molecule,
+    variant: crate::corrections::Variant,
+    mmok: bool,
+) -> Matrix {
     use crate::dual2::Dual2;
     let nat = molecule.atoms.len();
     let ndof = 3 * nat;
     let mut h = Matrix::zeros(ndof, ndof);
-    if variant == crate::corrections::Variant::Pm3 {
+    if variant == crate::corrections::Variant::Pm3 && !mmok {
         return h;
     }
     let (numbers, p0) = crate::corrections::geometry_f64(molecule);
@@ -180,7 +215,9 @@ fn correction_hessian(molecule: &Molecule, variant: crate::corrections::Variant)
             Dual2::var(p0[a][1], 1),
             Dual2::var(p0[a][2], 2),
         ];
-        let e = crate::corrections::correction_energy_g::<Dual2>(&numbers, &pos, variant);
+        let e = crate::corrections::correction_energy_with_mmok_g::<Dual2>(
+            &numbers, &pos, variant, mmok,
+        );
         for k in 0..3 {
             for l in 0..3 {
                 h[(3 * a + k, 3 * a + l)] = e.h[k][l];
@@ -207,8 +244,8 @@ fn correction_hessian(molecule: &Molecule, variant: crate::corrections::Variant)
                         let mut pos = base.clone();
                         pos[a][k] = Dual2::var(p0[a][k], 0);
                         pos[b][l] = Dual2::var(p0[b][l], 1);
-                        block[k][l] = crate::corrections::correction_energy_g::<Dual2>(
-                            &numbers, &pos, variant,
+                        block[k][l] = crate::corrections::correction_energy_with_mmok_g::<Dual2>(
+                            &numbers, &pos, variant, mmok,
                         )
                         .h[0][1];
                     }
@@ -324,20 +361,41 @@ pub fn vibrational_analysis(
             };
         }
     }
-    let (eigs, modes) = symmetric_eigen(&mw)?;
-    let frequencies_cm: Vec<f64> = eigs
+    // Translations and rotations are removed by **projection**, before diagonalizing, rather than
+    // recognised afterwards by being small. See `crate::rigid` for why: the rank comes from the
+    // geometry (six, five for a linear molecule, three for a lone atom), so a floppy torsion
+    // below any threshold worth choosing stays a vibration and a badly converged rigid mode does
+    // not become one.
+    let positions: Vec<crate::math::Vec3> = molecule.atoms.iter().map(|a| a.position).collect();
+    let rigid = crate::rigid::rigid_body_basis(
+        &positions,
+        &masses,
+        crate::rigid::RigidMotions::TranslationsAndRotations,
+    );
+    // What the Hessian would have said about those directions, kept as the diagnostic it is: it
+    // measures how well converged this second derivative is, and after projection the modes
+    // themselves are zero by construction and no longer say anything.
+    let rigid_residual_cm = crate::rigid::rayleigh_quotients(&rigid, &mw)
         .iter()
-        .map(|&lam| {
-            if lam >= 0.0 {
-                SQRT_EV_PER_ANG2_AMU_TO_CM * lam.sqrt()
-            } else {
-                -SQRT_EV_PER_ANG2_AMU_TO_CM * (-lam).sqrt()
-            }
-        })
-        .collect();
+        .map(|&lam| signed_wavenumber(lam).abs())
+        .fold(0.0_f64, f64::max);
+    crate::rigid::project_out_symmetric(&rigid, &mut mw);
+
+    let (mut eigs, modes) = symmetric_eigen(&mw)?;
+    // The projected directions are a null space up to round-off, which lands them at ±1e-15 and
+    // can put a spurious *imaginary* mode at the head of an otherwise clean spectrum. Setting
+    // them to exactly zero is not a threshold: the count is the rank found above, and the
+    // selection is which eigenvectors lie in that subspace.
+    let n_rigid = rigid.len();
+    for index in crate::rigid::rigid_mode_indices(&rigid, &modes) {
+        eigs[index] = 0.0;
+    }
+    let frequencies_cm: Vec<f64> = eigs.iter().map(|&lam| signed_wavenumber(lam)).collect();
 
     Ok(VibrationalModes {
         hessian,
+        n_rigid,
+        rigid_residual_cm,
         frequencies_cm,
         eigenvalues: eigs,
         modes,
@@ -346,7 +404,7 @@ pub fn vibrational_analysis(
 
 /// **Analytic (CPHF) Cartesian Hessian** (eV/Bohr²), robust to axis-aligned d/sparkle geometries.
 ///
-/// Thin wrapper over [`analytic_hessian_core`]. The d/sparkle two-center rotation
+/// Thin wrapper over `analytic_hessian_core`. The d/sparkle two-center rotation
 /// ([`crate::rotations::Rotation`]) parametrizes the diatomic frame by a polar/azimuthal angle
 /// pair that is singular when a bond lies on the global **z-axis** (`sqb = √(x²+y²) → 0`, the
 /// azimuth undefined): the analytic *second* derivatives of that one pair lose accuracy within
@@ -355,7 +413,7 @@ pub fn vibrational_analysis(
 /// molecule into a generic frame (every such bond then well off the z-axis, where the analytic
 /// path is correct to ~`1e-7`), evaluate the core Hessian there, and rotate it back **exactly**
 /// via `H = Qᵀ H_rot Q`, `Q = blockdiag(R0)`. Inputs with no near-axis d/sparkle pair skip all of
-/// this and are bit-identical to [`analytic_hessian_core`].
+/// this and are bit-identical to `analytic_hessian_core`.
 pub fn analytic_hessian(
     molecule: &Molecule,
     params: &Pm3Parameters,
@@ -635,6 +693,7 @@ fn analytic_hessian_core(
                         &core,
                         ap,
                         r_off,
+                        options.cphf_max_iter,
                     ),
                     _ => cphf_ov(
                         &gov[b],
@@ -646,7 +705,7 @@ fn analytic_hessian_core(
                         &basis,
                         &core,
                         None,
-                        CPHF_ITERATIONS,
+                        options.cphf_max_iter,
                     ),
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -681,7 +740,7 @@ fn analytic_hessian_core(
     // Symmetrize in place to keep peak Hessian storage bounded.
     symmetrize_average_in_place(&mut hess);
     // Classical D3/H4/X correction second derivatives (variant-dependent; zero for plain PM3).
-    let ch = correction_hessian(molecule, options.variant);
+    let ch = correction_hessian(molecule, options.variant, options.mmok);
     for i in 0..ndof {
         for j in 0..ndof {
             hess[(i, j)] += ch[(i, j)];
@@ -1021,6 +1080,7 @@ pub(crate) fn cphf_ov(
         return Err(Pm3Error::ScfNotConverged {
             iterations: max_iter,
             error: residual,
+            diagnosis: None,
         });
     }
     Ok(u)
@@ -1238,6 +1298,7 @@ fn cphf_ov_local(
     core: &crate::hamiltonian::CoreHamiltonian,
     atom_pairs: &[Vec<(usize, usize)>],
     r_off: f64,
+    max_iter: usize,
 ) -> Result<Matrix> {
     let nat = molecule.atoms.len();
     let r_on = (r_off - 2.0).max(0.0);
@@ -1306,7 +1367,7 @@ fn cphf_ov_local(
     let prof = std::env::var("PM3_TIMING").is_ok();
     let mut converged = false;
     let mut residual = f64::INFINITY;
-    for _ in 0..CPHF_ITERATIONS {
+    for _ in 0..max_iter {
         if prof {
             N_CPHF_ITER.fetch_add(1, Ordering::Relaxed);
             N_LOC_AOS.fetch_max(n_loc as u64, Ordering::Relaxed);
@@ -1378,8 +1439,9 @@ fn cphf_ov_local(
     }
     if !converged {
         return Err(Pm3Error::ScfNotConverged {
-            iterations: CPHF_ITERATIONS,
+            iterations: max_iter,
             error: residual,
+            diagnosis: None,
         });
     }
     Ok(u)
@@ -1594,7 +1656,7 @@ fn analytic_hessian_uhf(
                         params,
                         &basis,
                         &core,
-                        CPHF_ITERATIONS,
+                        options.cphf_max_iter,
                     )
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -1621,7 +1683,7 @@ fn analytic_hessian_uhf(
     // Symmetrize in place to avoid a duplicate Hessian allocation.
     symmetrize_average_in_place(&mut hess);
     // Classical D3/H4/X correction second derivatives (variant-dependent; zero for plain PM3).
-    let ch = correction_hessian(molecule, options.variant);
+    let ch = correction_hessian(molecule, options.variant, options.mmok);
     for i in 0..ndof {
         for j in 0..ndof {
             hess[(i, j)] += ch[(i, j)];
@@ -1921,6 +1983,7 @@ pub(crate) fn ucphf_ov(
         return Err(Pm3Error::ScfNotConverged {
             iterations: max_iter,
             error: residual,
+            diagnosis: None,
         });
     }
     Ok((ua, ub))
@@ -2020,7 +2083,9 @@ mod tests {
             &gov[0], &denom, &cv, &co, &molecule, &params, &basis, &core, None, 1,
         );
         match one_pass {
-            Err(crate::error::Pm3Error::ScfNotConverged { iterations, error }) => {
+            Err(crate::error::Pm3Error::ScfNotConverged {
+                iterations, error, ..
+            }) => {
                 assert_eq!(iterations, 1);
                 assert!(error > CPHF_TOLERANCE, "refused while inside tolerance");
             }
@@ -2452,11 +2517,26 @@ mod tests {
                 "PM3/MOPAC frequency mismatch: got {got}, expected {reference}"
             );
         }
-        // The six lowest (trans/rot) should be small in magnitude.
-        let six_low_max = freqs[..6].iter().map(|f| f.abs()).fold(0.0_f64, f64::max);
+        // The six rigid-body modes are exactly zero, not merely small: they are projected out
+        // before diagonalization. This used to allow `< 300.0`, which is a bound wide enough to
+        // swallow a real low-frequency vibration -- and two other files bounded the same quantity
+        // at 50 and 100.
+        // Exactly zero because they are assigned zero, not because the arithmetic happened to
+        // land there -- see the note in `tests/api_surface.rs`. Counted rather than sliced, since
+        // the zeros are the lowest modes only at a minimum.
+        assert_eq!(vib.n_rigid, 6);
+        assert_eq!(
+            freqs.iter().filter(|f| **f == 0.0).count(),
+            vib.n_rigid,
+            "expected {} exact zeros, got {freqs:?}",
+            vib.n_rigid
+        );
+        // What those directions carried before projection is still reported, and is the number
+        // the old assertion was really about: the quality of this Hessian.
         assert!(
-            six_low_max < 300.0,
-            "trans/rot not near zero: {six_low_max}"
+            vib.rigid_residual_cm < 50.0,
+            "the Hessian's rigid-body error is {} cm^-1, which is too large for a minimum",
+            vib.rigid_residual_cm
         );
     }
     /// The analytic Hessian in a field, against a finite difference of the analytic gradient.

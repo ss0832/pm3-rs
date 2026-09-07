@@ -461,6 +461,46 @@ each image's displacement scaled by its own `e^{iq·T}`, validated by folding a
 hydrogen-bonded chain onto its own doubled cell. The Γ-point analytic Hessian
 reaches 1D and 2D the same way, its Ewald block being the phased sum at `q = 0`.
 
+## A meshed `D(q)` was wrong at `q = 0`, and is fixed in 0.2.4
+
+Through 0.2.3, `dynamical_matrix_on_mesh` / `phonons(..., kpts=...)` / `--kpts`
+with `--q` returned a badly wrong answer at `q = 0`. Measured on rocksalt NaCl at
+its experimental lattice constant, `3×3×3` mesh, in eV/Å²:
+
+| | `D_xx` | `D_yy` | `D_zz` |
+|---|---:|---:|---:|
+| central difference of the analytic forces | +2.16 | +2.16 | +2.16 |
+| `dynamical_matrix_on_mesh`, 0.2.3 | **−4.61** | **−1.28** | **−1.28** |
+| `dynamical_matrix_on_mesh`, 0.2.4 | +2.16 | +2.16 | +2.16 |
+
+Three things had been wrong at once — the magnitude, the isotropy a cubic crystal
+must have, and the *sign*, which reported an imaginary optical mode for a
+structure that is a minimum.
+
+**The cause was one substitution made in two places.** `P(T) = P(0)` — one density
+matrix serving every lattice image — *is* Γ sampling: a single k-point cannot tell
+images apart, so it holds there by construction. On a mesh it is false, because
+`P(0)` becomes the Brillouin-zone average while `P(T)` decays with `T`.
+
+- `phased_skeleton` passed one density matrix to `pair_block` for every image. The
+  skeleton is the larger half of `D(q)`, so a meshed run built its dominant term
+  from the wrong density.
+- `bare_blocks` read `exchange_scale · P^σ(0)` for the exchange part of each bare
+  perturbation, where the response needs `P^σ(T)`. `SpinChannel::p_images` already
+  carried the right thing under both samplings; nothing was reading it.
+
+Both now read the per-image density. Γ sampling is unchanged, bit for bit: at Γ
+the two expressions are the same number.
+
+The clue that identified it had been recorded for a release and not used — the
+error converged smoothly with mesh size, 0% at `1³` rising to 77% at `7³`. Zero at
+`1³` is the tell: a `1×1×1` mesh *is* Γ, where the substitution is exactly true.
+
+`tests/pbc_cubic_identities.rs` holds both identities on a mesh, and
+`pbc::dfpt::tests::the_meshed_skeleton_is_where_the_cubic_symmetry_breaks` runs
+the skeleton without the response under both samplings — a separation no public
+entry point offers, and what made the second occurrence findable.
+
 ## Response properties
 
 Everything in this section is a contraction of the same first-order density the
@@ -597,10 +637,40 @@ so it is known rather than discovered:
   level shifts to 5 eV, and at a thousand iterations. Two eV of smearing does converge — to a
   *different* solution 200 eV away.
 
-  The chemical potential is what gives it away: it swings by an electronvolt every iteration as
-  occupations flip. An even Γ-centred mesh on a cubic cell puts every one of its points on a
-  zone-boundary symmetry point, where bands meet; a Fermi level inside a degenerate manifold has
-  no stable filling to find, and the bisection reassigns it each pass.
+  The chemical potential is what gives it away: it swings by an electronvolt every iteration. An
+  even Γ-centred mesh on a cubic cell puts every one of its points on a zone-boundary symmetry
+  point, where bands meet.
+
+  > **The mechanism above is now measured, and the "occupations flip" half of it is wrong.**
+  > `PM3_KSCF_TRACE=1` reports the occupation-flip count and the per-atom populations alongside
+  > the residual. On the **primitive** two-atom cell at 5.64 Å with a `2×2×2` mesh, the flip count
+  > is **zero at every iteration** — the occupations never change sides — while a full **1.1
+  > electrons** move between Na and Cl each pass and `μ` follows across twelve electronvolts. It
+  > is charge sloshing, not a Fermi level trapped in a degenerate manifold; the charge moves first
+  > and `μ` follows it. That cell also *recovers*, converging unaided to `−341.786 eV`.
+  >
+  > **And converging is not the point.** The primitive cell on a `2×2×2` mesh converges, cleanly,
+  > to a state with **−2.10 electrons of charge on the sodium**, where every mesh from `3³` to
+  > `7³` puts `+0.16` to `+0.24` there and agrees on the energy to 0.06 eV. A sodium that has
+  > gained two electrons is not a chemical result, and nothing in the energy, the residual or the
+  > `converged` flag says so. `KpointResult::charge_swing` does: the even mesh swings **1.44
+  > electrons** on its way there against the odd mesh's 0.29. **Check it, and check the charges.**
+  >
+  > **It is not a mixing problem, and three standard remedies say so.** A deeper Pulay history
+  > (8 → 24) moves diamond's residual from `3.72e-5` to `3.41e-5`; Kerker preconditioning of the
+  > atomic-charge channel makes NaCl's sloshing *worse* (1.44 → 2.56 electrons of swing); handing
+  > damping over to the accelerator, as the Γ path does, converges diamond and silicon and breaks
+  > four k-point identities. What the Kerker experiment showed instead is the actual shape of the
+  > problem: **three different mixers reach three different converged solutions on the same cell
+  > and mesh** — `−341.79`, `−366.34` and `−379.22 eV`, with `−2.10`, `−4.35` and `−4.94`
+  > electrons on the sodium — while every odd mesh agrees on `−327.45` and `+0.17`. The
+  > fixed-point map has several attractors at that sampling and the mixer picks among them. No
+  > preconditioner fixes that. Use an odd mesh, and check `charge_swing`.
+  >
+  > The conventional-cell failure `tests/crystals.rs` pins is a different system and has not been
+  > re-measured with the trace. Run it before repeating the explanation above.
+  > `examples/scf_hardening.rs` has the ladder, and a failed SCF now carries its own diagnosis in
+  > the error rather than only a residual.
 
   Odd meshes do not sit on those points. `3×3×3` converges in eighteen iterations, and the answer
   is right: energies agree to 0.02 eV and charges to 0.02 electrons across `3×3×3`, `4×4×4` and

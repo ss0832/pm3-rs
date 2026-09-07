@@ -33,12 +33,29 @@ Every function/calculator accepts the same model selectors:
 | `charge`       | int                                               | total (formal) molecular charge |
 | `multiplicity` | int (`1`=singlet, `2`=doublet, …)                 | spin multiplicity `2S+1` |
 | `reference`    | `"auto"` (default), `"rhf"`, `"uhf"`              | SCF reference; `auto` = RHF closed shell / UHF open shell |
-| `method`       | `"pm3"` (default), `"pm3-d3"`, `"pm3-d3h4"`, `"pm3-d3h4x"` | correction variant |
+| `method`       | `"pm3"` (default), `"pm3-d3"`, `"pm3-d3h4"`, `"pm3-d3h4x"`, each optionally `+mmok` | correction variant |
 | `field`        | `[x, y, z]` in **V/Å**, or `None` (default)       | uniform external electric field; molecular only |
 
 The `method` variant selects the post-SCF classical corrections — Grimme **D3**
 dispersion, the Řezáč **H4** hydrogen-bond term, and the **X** halogen-bond term.
 They contribute to the energy, the analytic gradient **and** the analytic Hessian.
+
+### `+mmok`, and why MOPAC's default is not PM3
+
+Appending `+mmok` — `method="pm3+mmok"`, `method="pm3-d3h4+mmok"` — switches on
+MOPAC's `MMOK` correction: a classical `K·sin²(O=C–N–H)` term, `K = 7.1853
+kcal/mol` per amide hydrogen, added to the heat of formation after the SCF to
+restore the peptide rotation barrier that an NDDO Hamiltonian has no term for.
+
+**It is off by default here and on by default in MOPAC.** That difference is
+deliberate: the term is not part of PM3, so a heat of formation with it in is not
+comparable to a published PM3 number. It matters only for amides, and there it
+matters a lot — on acetamide it moves the heat of formation by 2.3 kcal/mol while
+leaving the density, the dipole and every orbital energy untouched, which is
+exactly what makes it easy to mistake for a discrepancy.
+
+So: to compare against a MOPAC run, either give MOPAC `NOMM` or give pm3-rs
+`+mmok`. `tests/data/mopac_oracle.tsv` takes the first route.
 
 `field` is volts per Ångström, the unit MOPAC's own `FIELD=` keyword takes, and
 reaches the energy, the analytic gradient and the analytic Hessian for both
@@ -80,8 +97,18 @@ Forces `= −dE/dR`. Keys: `energy_hartree`, `energy_ev`, `heat_of_formation_kca
 
 ### `optimize(...) -> dict`
 L-BFGS geometry optimization on the analytic gradient. Keys:
-`positions_angstrom` (`(N, 3)`), `energy_hartree`, `heat_of_formation_kcal`,
-`converged`, `iterations`.
+`positions_angstrom` (`(N, 3)`), `energy_hartree`, `energy_ev`,
+`heat_of_formation_kcal`, `converged`, `iterations`, plus `positions` and
+`steps` as aliases for the first and the last.
+
+The aliases exist because this function and [`relax`](#relaxnumbers-positions-cell--fixed_cellfalse---dict)
+— the same operation on a periodic cell — used to return **disjoint** key sets:
+this one had `positions_angstrom` / `energy_hartree` / `iterations` and no
+`energy_ev`, `relax` had `positions` / `energy_ev` / `steps` and no heat of
+formation. Reading the docs for one and applying them to the other ended a
+structure optimization with a `KeyError`, in either direction. Both names are
+now carried by both functions; `tests/test_api_key_contract.py` holds every
+native function to the keys it documents.
 
 ### `frequencies(...) -> dict`
 Harmonic vibrational frequencies from the analytic (CPHF) Hessian. Evaluate at a
@@ -304,13 +331,37 @@ dimensionality — a component along a non-periodic axis is refused. `kpts` give
 the response a Monkhorst–Pack mesh to sum over instead of Γ alone. There is no
 acoustic sum rule away from Γ, so no residual is reported there.
 
+**The polarization vectors come back with the frequencies.** A frequency says how
+fast a mode vibrates; the eigenvector says what moves in it, which is what
+separates an optical branch from an acoustic one and what a visualization draws.
+
+| sampling | key | shape | meaning |
+|---|---|---|---|
+| Γ | `modes` | `3N × 3N`, real | `modes[m][3*a + i]` is the **mass-weighted** displacement of atom `a` along axis `i` in mode `m` |
+| at `q` | `modes_real`, `modes_imag` | same, two halves | complex, because atoms in a cell move with a relative phase |
+
+`masses` (amu, atom order) is what de-weights them: the Cartesian displacement is
+`modes[m][3*a + i] / sqrt(masses[a])`. Both halves are returned at finite `q`
+rather than a magnitude — collapsing them turns a travelling wave into a standing
+one.
+
+`cphf_max_iter` raises the coupled-perturbed iteration cap behind the response;
+`None` keeps the default of 400.
+
 ```python
+import numpy as np
 from pm3_rs import native
 chain = dict(numbers=[8, 1, 1],
              positions=[[0, 0, 0.117], [0, 0.757, -0.469], [0, -0.757, -0.469]],
              cell=[[6.0, 0, 0], [0, 20.0, 0], [0, 0, 20.0]],
              pbc=[True, False, False])
 zone_boundary = native.phonons(**chain, q=[0.5, 0.0, 0.0])["frequencies_cm"]
+
+# What actually moves in the highest Γ mode.
+gamma = native.phonons(**chain)
+top = int(np.argmax(gamma["frequencies_cm"]))
+displacement = (np.asarray(gamma["modes"][top]).reshape(-1, 3)
+                / np.sqrt(gamma["masses"])[:, None])
 ```
 
 ### `dipole(numbers, positions, ..., operator=False) -> dict`
@@ -352,8 +403,11 @@ for a restricted run) and `fermi_ev`.
 
 Variable-cell relaxation: the atoms and the lattice vectors that exist.
 `force_tol` is eV/Å and `stress_tol` eV/Å³. Returns the relaxed `positions` and
-`cell` in Ångström, plus `energy_ev`, `converged` and `steps`. An isolated cell
-is refused, having no strain to relax against.
+`cell` in Ångström, plus `energy_ev`, `energy_hartree`,
+`heat_of_formation_kcal`, `converged` and `steps`, with `positions_angstrom` and
+`iterations` as aliases. An isolated cell is refused, having no strain to relax
+against. See [`optimize`](#optimize---dict) for why both sets of names are
+carried.
 
 `stress_tol` is a *density*, so converting it is the **cube** of the length
 conversion. Through 0.2.1 it went to the optimizer unconverted while `force_tol`
@@ -371,6 +425,25 @@ what the partitioning traded.
 `long_range_cutoff` is the **molecular** near-field split; the periodic path
 takes its long range from the lattice sum and does not read it, so passing both
 a cell and a cutoff is refused rather than quietly running the unscreened route.
+
+### `divide_and_conquer_optimize(numbers, positions, ...) -> dict`
+
+The same L-BFGS as `optimize`, driven by the partitioned gradient instead of a
+full diagonalization — for the case the method exists for, where a full
+diagonalization per line-search trial is not affordable. Arguments are
+`divide_and_conquer`'s plus `max_steps` and `force_tol` (eV/Å).
+
+Returns the same names as `optimize` and `relax` — `positions_angstrom` /
+`positions`, `energy_ev` / `energy_hartree`, `heat_of_formation_kcal`,
+`converged`, `iterations` / `steps` — plus `n_subsystems`.
+
+Molecular only: the partitioned path has no cell gradient, so a periodic
+structure would be relaxed at fixed cell without saying so. Use `relax` there.
+
+The caveat on `divide_and_conquer_forces` gets worse here. A partitioned gradient
+is not the exact derivative of the partitioned energy, so what this converges to
+is the **buffer's** minimum, not the method's. Widen `buffer_radius` and re-run
+before believing a structure.
 
 ### `born_charges(numbers, positions, cell, ..., enforce=False) -> dict`
 

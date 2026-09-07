@@ -1,7 +1,25 @@
 # Third-party notices
 
 `pm3-rs` is GPL-3.0-or-later. This document records the provenance of its
-scientific parameters and reference algorithms.
+scientific parameters and reference algorithms, with the citations.
+
+**[`third_party/README.md`](third_party/README.md) is the index**: one table
+saying, for each upstream project, what `pm3-rs` takes from it, under which
+license, and which files here hold the terms. Each `third_party/<name>/NOTICE`
+records the same for that project in detail. Start there if the question is
+"what is owed to whom"; this file is the bibliography.
+
+No third-party source code is vendored in this repository. What crosses the
+boundary is published numeric parameters and published working equations.
+
+That is true of the *repository*. It is not true of the **binaries**: the Rust
+dependency graph is statically linked into `_native.pyd` and the `pm3-rs`
+command, so around sixty crates are compiled into everything this project ships.
+They are recorded separately in
+[`third_party/rust-crates/NOTICE`](third_party/rust-crates/NOTICE), with the
+verbatim texts in `LICENSES.txt` beside it, because the obligation they carry is
+a different one: MIT asks for the copyright notice to travel with the binary,
+not for a citation in a bibliography. See "Rust dependencies" below.
 
 ## PM3
 
@@ -32,6 +50,11 @@ multipoles, one- and two-center NDDO integrals, PM3 core-core repulsion, SCF
 bookkeeping, and special zero-orbital cores. The implementation is original
 Rust code; no MOPAC Fortran source is redistributed.
 
+MOPAC contributes in three distinct roles — redistributed parameter data,
+followed-but-not-copied equations, and a build-time oracle that never ships —
+which carry different obligations. [`third_party/mopac/NOTICE`](third_party/mopac/NOTICE)
+separates them and names the upstream file behind each.
+
 ## D3, H4, and X corrections
 
 - D3: S. Grimme, J. Antony, S. Ehrlich, and H. Krieg, *J. Chem. Phys.*
@@ -58,6 +81,35 @@ implemented by PySEQM:
 - G. Zhou et al., *J. Chem. Theory Comput.* **16**, 4951 (2020)
 - BSD-3-Clause; see `third_party/pyseqm/NOTICE`
 
-Apache-2.0 and BSD-3-Clause are compatible with GPL-3.0-or-later for this use.
-Numeric scientific parameter values are retained with provenance regardless of
-their copyright status.
+## Rust dependencies
+
+Everything above concerns *scientific* provenance — parameters and equations —
+and none of it is code that ships. The Rust crates are the opposite case: no
+science crosses from them, and all of their code does.
+
+`faer` (linear algebra), `rayon` (parallelism) and `pyo3` (the Python bindings)
+are the three direct dependencies; with their transitive closure that is around
+sixty crates, statically linked into `_native.pyd` and the `pm3-rs` executable.
+Most are MIT, which requires the copyright notice and the permission notice to
+be included in "all copies or substantial portions of the Software" — which a
+static binary is. A handful carry other terms: `atomic-wait` is BSD-2-Clause,
+`bytemuck` offers Zlib, `target-lexicon` is Apache-2.0 with the LLVM exception,
+and `unicode-ident` is `(MIT OR Apache-2.0) AND Unicode-3.0`, where the `AND`
+means the Unicode terms apply on top rather than as an alternative.
+
+- index, with the SPDX expression and files found per crate:
+  [`third_party/rust-crates/NOTICE`](third_party/rust-crates/NOTICE)
+- the verbatim texts, with their copyright lines:
+  `third_party/rust-crates/LICENSES.txt`
+- regenerate with `python tools/collect_rust_notices.py` after changing a
+  dependency; `tests/attribution.rs` fails if the graph and the index disagree
+
+`faer` additionally carries upstream attributions of its own — Eigen (MPL-2.0),
+LAPACK and SuiteSparse (BSD) — which are reproduced in `LICENSES.txt` along with
+everything else, rather than being left one level up the chain.
+
+Apache-2.0 and BSD-3-Clause are compatible with GPL-3.0-or-later for this use,
+as are MIT, BSD-2-Clause, Zlib, MPL-2.0 and Apache-2.0-WITH-LLVM-exception; the
+compatibility is one-way, and this project is the GPL end of it. Numeric
+scientific parameter values are retained with provenance regardless of their
+copyright status.

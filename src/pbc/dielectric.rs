@@ -7,7 +7,7 @@
 //! ```
 //!
 //! Both come from the same coupled-perturbed solve the phonons use, driven by the dipole
-//! operator instead of by a nuclear displacement — see [`crate::pbc::dfpt::field_response`] for
+//! operator instead of by a nuclear displacement — see `pbc::dfpt::field_response` for
 //! why that is legitimate under periodic boundary conditions when a *finite* field is not.
 //!
 //! # What `ε∞` is and is not
@@ -28,7 +28,7 @@
 //! well defined in every dimensionality and is returned by [`polarizability`] unconverted.
 //!
 //! The macroscopic longitudinal response at finite `q` behaves differently in each dimensionality
-//! — see [`dielectric_function`] — and only in 3D is it the constant that `ε∞` names.
+//! — see `dielectric_function` — and only in 3D is it the constant that `ε∞` names.
 
 // A note on `clippy::needless_range_loop`, allowed below.
 //
@@ -208,17 +208,25 @@ fn polarizability_and_dielectric(
 /// which this crate already had, so this is a contraction of existing quantities rather than
 /// another response to solve. Semiempirical codes commonly stop at `ε∞` for want of the first of
 /// those, not for want of this formula.
-/// Below this `ω²`, a mode is left out of the ionic sum and counted in `skipped_modes`.
+/// **Deprecated and no longer used.** Kept so a caller that read it still compiles.
 ///
-/// In the units the mass-weighted Γ matrix is diagonalized in, `eV/(Å²·amu)`.
+/// This was the `ω²` below which a mode was left out of the ionic sum, in the units the
+/// mass-weighted Γ matrix is diagonalized in, `eV/(Å²·amu)`. It was placed in a measured gap
+/// rather than guessed — `examples/soft_mode_floor.rs` shows the acoustic branch landing between
+/// `1e-17` and `5e-15` across five cell widths, and the softest genuine mode at `+2.5e-2` — and
+/// that gap is thirteen orders of magnitude wide, so the classification was never close to the
+/// line.
 ///
-/// Placed in a measured gap rather than guessed. `examples/soft_mode_floor.rs` prints the same
-/// eigenvalues this is compared against: across five cell widths the acoustic branch lands
-/// between `1e-17` and `5e-15`, and the softest genuine mode at `+2.5e-2`. This sits near the
-/// middle of those thirteen orders of magnitude, so neither classification is close to the line.
-///
-/// Exported so the threshold a caller's `skipped_modes` was measured against is a value they can
-/// read, rather than a number written once here and again in the documentation.
+/// It is still gone, because a measured gap is a property of the systems it was measured on. The
+/// acoustic branch is now **projected out** of the mass-weighted matrix before diagonalization
+/// (see [`crate::rigid`]), which puts it at exactly zero, so the sum tests `ω² ≤ 0` and no
+/// magnitude enters. A soft mode in a cell near a phase transition is then kept because it is a
+/// real mode, not dropped because it was smaller than a constant chosen elsewhere.
+#[deprecated(
+    since = "0.2.4",
+    note = "the acoustic branch is projected out, so the ionic sum needs no floor; \
+            StaticDielectric::skipped_modes now counts exact zeros and imaginary modes"
+)]
 pub const SOFT_MODE_FLOOR: f64 = 1.0e-6;
 
 pub fn static_dielectric_tensor(
@@ -257,7 +265,22 @@ pub fn static_dielectric_tensor(
             }
         }
     }
-    let (eigenvalues, vectors) = crate::cmatrix::hermitian_eigen(&weighted)?;
+    // Project the acoustic branch out before diagonalizing, rather than recognising it afterwards
+    // by being small. The three translations are exact null vectors of `D(0)`, so removing them
+    // leaves the sum below with nothing to classify: what used to be "`ω²` below `1e-6`, which is
+    // where a measured gap put the line" is now "`ω² ≤ 0`", and the only modes that meets are the
+    // three that were projected (exactly zero) and any genuinely imaginary one.
+    let positions: Vec<crate::math::Vec3> = molecule.atoms.iter().map(|a| a.position).collect();
+    let acoustic = crate::rigid::rigid_body_basis(
+        &positions,
+        masses,
+        crate::rigid::RigidMotions::TranslationsOnly,
+    );
+    crate::rigid::project_out_hermitian(&acoustic, &mut weighted);
+    let (mut eigenvalues, vectors) = crate::cmatrix::hermitian_eigen(&weighted)?;
+    for index in crate::rigid::rigid_mode_indices_complex(&acoustic, &vectors) {
+        eigenvalues[index] = 0.0;
+    }
 
     // `4π/Ω · e²Å²/eV` to dimensionless. `e²/Hartree = Bohr`, so the chain is
     // `e²Å²/eV → (eV per Hartree) → e²Å²/Hartree = Bohr·Å² → Bohr³` via `Å² = a0² Bohr²`.
@@ -268,7 +291,9 @@ pub fn static_dielectric_tensor(
     let mut skipped_modes = 0usize;
     for mode in 0..ndof {
         let omega2 = eigenvalues[mode];
-        if omega2 <= SOFT_MODE_FLOOR {
+        // No floor. The acoustic branch is exactly zero because it was projected out above, and
+        // what is left below zero is a genuinely imaginary mode, which the sum cannot use either.
+        if omega2 <= 0.0 {
             skipped_modes += 1;
             continue;
         }

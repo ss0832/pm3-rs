@@ -89,7 +89,12 @@ pub fn dc_gradient(
     } else {
         crate::gradient::fixed_density_gradient(molecule, params, &scf.density)?
     };
-    crate::gradient::add_correction_gradient(molecule, options.variant, &mut gradient);
+    crate::gradient::add_correction_gradient(
+        molecule,
+        options.variant,
+        options.mmok,
+        &mut gradient,
+    );
     // `−q_A f`, the force a net charge feels in the field. `fixed_density_gradient` above builds
     // its core Hamiltonian without a field, so nothing else here would supply it, and the energy
     // `run_dc` reported *does* include the field — a gradient missing this term is inconsistent

@@ -31,7 +31,7 @@
 //! In 3D the `G = 0` term of the reciprocal sum is omitted, which is the **tinfoil**
 //! (conducting) boundary condition. A finite cluster summed in vacuum converges to a different
 //! value, differing by the depolarizing energy of its own surface charge; the tests bridge the
-//! two explicitly with [`crate::pbc::ewald_reference::surface_dipole_energy`] rather than
+//! two explicitly with `pbc::ewald_reference::surface_dipole_energy` rather than
 //! pretending the ambiguity does not exist.
 //!
 //! # Charged cells
@@ -54,9 +54,10 @@ use crate::cell::Cell;
 use crate::constants::PM3_EV;
 use crate::error::{Pm3Error, Result};
 use crate::math::{Mat3, Vec3};
-use crate::neighbor::NeighborList;
+use crate::neighbor::{NeighborList, PairImage};
 use crate::special::{erf, erfc, erfcx};
 use std::f64::consts::{PI, TAU};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// One point charge participating in the lattice sum.
 ///
@@ -236,10 +237,39 @@ pub struct EwaldContext {
     /// Real-space pairs inside the cutoff.
     neighbors: NeighborList,
     n_sites: usize,
+    /// `erfc(αr)/r` and the geometric half of its derivative, one entry per **ordered** pair,
+    /// indexed exactly like `neighbors.all()`. Empty when the table exceeded its budget.
+    ///
+    /// This is what a periodic SCF actually spends its time on. The real-space sum was 97% of
+    /// the Ewald and the Ewald 97% of the iteration -- and every one of those iterations
+    /// recomputed `erfc` and `exp` for every pair, twice (once for the energy, once for the
+    /// potentials), at distances that had not moved since the geometry was set. Only the charges
+    /// change inside an SCF, so the transcendentals are geometry and belong here with the phase
+    /// table.
+    ///
+    /// Excluded pairs (`T = 0` on one atom, whose energy is the NDDO one-center set) and
+    /// zero-distance pairs are stored as zeros, so the summation loops are branch-free
+    /// multiplies rather than a predicate per pair.
+    real_kernel: Vec<RealKernel>,
+    /// The `α` the kernel was tabulated at, so a mismatched `params` is refused rather than
+    /// silently answered with the wrong screening.
+    alpha: f64,
+}
+
+/// The geometry-only part of one real-space pair term.
+#[derive(Clone, Copy, Debug, Default)]
+struct RealKernel {
+    /// `erfc(αr)/r`.
+    screened: f64,
+    /// `f'(r)/r` with `f(r) = erfc(αr)/r` — the gradient coefficient once multiplied by `q_a q_b`.
+    dcoef: f64,
 }
 
 /// Ceiling on the cached `cos`/`sin` table.
 pub const PHASE_TABLE_BUDGET_MB: usize = 256;
+
+/// Ceiling on the cached real-space kernel.
+pub const REAL_KERNEL_BUDGET_MB: usize = 256;
 
 impl EwaldContext {
     /// Build the cache for a fixed set of site *positions*. The charges are irrelevant here and
@@ -253,6 +283,8 @@ impl EwaldContext {
                 phases: Vec::new(),
                 neighbors: NeighborList::build_from_positions(&[], None, 0.0),
                 n_sites: sites.len(),
+                real_kernel: Vec::new(),
+                alpha: params.alpha,
             };
         }
         let positions: Vec<Vec3> = sites.iter().map(|s| s.position).collect();
@@ -277,11 +309,42 @@ impl EwaldContext {
         } else {
             Vec::new()
         };
+        // The real-space kernel, tabulated once for this geometry. Two doubles per ordered pair
+        // against the phase table's two per (G, site), and it removes an `erfc` and an `exp`
+        // from every pair of every SCF iteration.
+        let pair_budget = REAL_KERNEL_BUDGET_MB * 1024 * 1024 / std::mem::size_of::<RealKernel>();
+        let real_kernel = if !neighbors.all().is_empty() && neighbors.len() <= pair_budget {
+            let alpha = params.alpha;
+            let two_alpha_over_sqrt_pi = 2.0 * alpha / PI.sqrt();
+            neighbors
+                .all()
+                .iter()
+                .map(|pair| {
+                    let r = pair.r;
+                    if r <= 0.0 || excluded(sites, pair.a, pair.b, pair.t) {
+                        return RealKernel::default();
+                    }
+                    let screened = erfc(alpha * r) / r;
+                    // f(r) = erfc(αr)/r, f'(r) = −erfc(αr)/r² − (2α/√π) e^{−α²r²}/r
+                    let derivative =
+                        -(screened / r) - two_alpha_over_sqrt_pi * (-(alpha * r).powi(2)).exp() / r;
+                    RealKernel {
+                        screened,
+                        dcoef: derivative / r,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         Self {
             gvectors,
             phases,
             neighbors,
             n_sites: sites.len(),
+            real_kernel,
+            alpha: params.alpha,
         }
     }
 
@@ -294,6 +357,52 @@ impl EwaldContext {
         } else {
             self.phases[g_index * self.n_sites + site]
         }
+    }
+}
+
+/// Where the time inside a 3D Ewald sum goes, in nanoseconds, cumulative over the process.
+///
+/// The lattice sum is 89–98% of every periodic SCF iteration (`examples/periodic_profile.rs`),
+/// and which *half* of it dominates is not something reading settles: parallelising the
+/// reciprocal sum on the strength of a guess moved a 48-atom iteration from 174 ms to 170 ms.
+/// So the halves are counted rather than argued about. Read with [`profile_snapshot`]; the
+/// counters cost one `Instant::now()` per call and are always on, because a profiler you have
+/// to enable is one nobody enables.
+pub(crate) struct EwaldProfile {
+    pub real: AtomicU64,
+    pub reciprocal: AtomicU64,
+    pub corrections: AtomicU64,
+}
+
+pub(crate) static PROFILE: EwaldProfile = EwaldProfile {
+    real: AtomicU64::new(0),
+    reciprocal: AtomicU64::new(0),
+    corrections: AtomicU64::new(0),
+};
+
+/// `(real, reciprocal, corrections)` in seconds.
+pub(crate) fn profile_snapshot() -> (f64, f64, f64) {
+    let read = |counter: &AtomicU64| counter.load(Ordering::Relaxed) as f64 * 1.0e-9;
+    (
+        read(&PROFILE.real),
+        read(&PROFILE.reciprocal),
+        read(&PROFILE.corrections),
+    )
+}
+
+/// A cursor that charges each elapsed span to a counter and resets.
+struct Stopwatch(std::time::Instant);
+
+impl Stopwatch {
+    fn start() -> Self {
+        Self(std::time::Instant::now())
+    }
+
+    fn lap(&mut self, counter: &AtomicU64) {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.0).as_nanos() as u64;
+        counter.fetch_add(elapsed, Ordering::Relaxed);
+        self.0 = now;
     }
 }
 
@@ -326,7 +435,7 @@ pub fn ewald(cell: &Cell, sites: &[ChargeSite], params: &EwaldParams) -> Result<
 /// The caller is responsible for the context matching the geometry: it is rebuilt whenever an
 /// atom moves and reused across the iterations of one SCF, where nothing but the charges changes.
 /// A mismatched site count is caught; a moved atom with the same count is not, which is why the
-/// only thing that builds one is [`crate::pbc::gamma::build_setup`], alongside the geometry it
+/// only thing that builds one is `pbc::gamma::build_setup`, alongside the geometry it
 /// describes.
 pub fn ewald_cached(
     cell: &Cell,
@@ -344,6 +453,18 @@ pub fn ewald_cached(
             sites.len()
         )));
     }
+    // The real-space kernel is tabulated at one `α`. Using it at another is not an error the
+    // arithmetic would reveal -- the screening would simply be wrong by a smooth factor, and the
+    // reciprocal half would still be computed at the new `α`, so the two halves would no longer
+    // add up to `1/r`. The result is a plausible energy that is wrong, which is why this is
+    // checked rather than assumed.
+    if !context.real_kernel.is_empty() && context.alpha != params.alpha {
+        return Err(Pm3Error::InvalidInput(format!(
+            "the Ewald cache was tabulated at alpha={} but was handed params with alpha={}; \
+             rebuild the context when the splitting parameter changes",
+            context.alpha, params.alpha
+        )));
+    }
     let dimension = cell.n_periodic();
     let mut out = EwaldOutput::zeros(sites.len());
     if dimension == 0 {
@@ -354,11 +475,15 @@ pub fn ewald_cached(
     match dimension {
         3 => {
             let mut virial = Mat3::zero();
+            let mut clock = Stopwatch::start();
             real_space(sites, params, &mut out, Some(&mut virial), context);
+            clock.lap(&PROFILE.real);
             reciprocal_3d(cell, sites, params, &mut out, &mut virial, context);
+            clock.lap(&PROFILE.reciprocal);
             self_term(sites, params, &mut out);
             background_3d(cell, sites, params, &mut out, &mut virial);
             remove_excluded_smooth_part(sites, params, &mut out, Some(&mut virial));
+            clock.lap(&PROFILE.corrections);
             out.virial = Some(virial);
         }
         2 => {
@@ -906,25 +1031,39 @@ fn real_space(
     let alpha = params.alpha;
     let two_alpha_over_sqrt_pi = 2.0 * alpha / PI.sqrt();
 
-    // Each distinct interaction once, for the energy and the virial.
-    for pair in list.unique() {
+    // `erfc` and `exp` at distances that do not move while the charges do. Read from the table
+    // where there is one; recompute where the geometry was too big to tabulate.
+    let kernel = |index: usize, pair: &PairImage| -> RealKernel {
+        if let Some(entry) = context.real_kernel.get(index) {
+            return *entry;
+        }
         let r = pair.r;
-        if r <= 0.0 {
+        if r <= 0.0 || excluded(sites, pair.a, pair.b, pair.t) {
+            return RealKernel::default();
+        }
+        let screened = erfc(alpha * r) / r;
+        let derivative =
+            -(screened / r) - two_alpha_over_sqrt_pi * (-(alpha * r).powi(2)).exp() / r;
+        RealKernel {
+            screened,
+            dcoef: derivative / r,
+        }
+    };
+
+    // Each distinct interaction once, for the energy and the virial.
+    for (index, pair) in list.all().iter().enumerate() {
+        if !pair.is_unique_representative() {
             continue;
         }
-        if excluded(sites, pair.a, pair.b, pair.t) {
+        let entry = kernel(index, pair);
+        if entry.screened == 0.0 {
             continue;
         }
         let qq = sites[pair.a].charge * sites[pair.b].charge;
-        let screened = erfc(alpha * r) / r;
-        out.energy_ev += PM3_EV * qq * screened;
+        out.energy_ev += PM3_EV * qq * entry.screened;
 
-        // f(r) = erfc(αr)/r,  f'(r) = −erfc(αr)/r² − (2α/√π) e^{−α²r²}/r
-        let derivative =
-            -(screened / r) - two_alpha_over_sqrt_pi * (-(alpha * r).powi(2)).exp() / r;
         // dE/dr_a = q q f'(r) · (−d/r);  dE/dr_b = +the same vector.
-        let coefficient = PM3_EV * qq * derivative / r;
-        let contribution = pair.dvec * coefficient;
+        let contribution = pair.dvec * (PM3_EV * qq * entry.dcoef);
         out.site_gradient[pair.a] -= contribution;
         out.site_gradient[pair.b] += contribution;
         // dE/dε_αβ = Σ q q f'(r) d_α d_β / r
@@ -933,11 +1072,13 @@ fn real_space(
         }
     }
 
-    // Every ordered pair, for the potentials: φ_i = Σ_j q_j erfc(α r)/r.
-    for pair in list.all() {
-        if pair.r > 0.0 && !excluded(sites, pair.a, pair.b, pair.t) {
-            out.site_potential_ev[pair.a] +=
-                PM3_EV * sites[pair.b].charge * erfc(alpha * pair.r) / pair.r;
+    // Every ordered pair, for the potentials: φ_i = Σ_j q_j erfc(α r)/r. The same kernel the
+    // energy loop above just used, at the same distances -- it used to be a second `erfc` per
+    // pair, so an SCF iteration evaluated the function twice for every pair in the cutoff.
+    for (index, pair) in list.all().iter().enumerate() {
+        let screened = kernel(index, pair).screened;
+        if screened != 0.0 {
+            out.site_potential_ev[pair.a] += PM3_EV * sites[pair.b].charge * screened;
         }
     }
 }
@@ -1006,47 +1147,107 @@ fn reciprocal_3d(
     context: &EwaldContext,
 ) {
     let volume = cell.measure();
-    // 2π/V, doubled because eciprocal_vectors returns only half of each ±G pair.
+    // 2π/V, doubled because reciprocal_vectors returns only half of each ±G pair.
     let prefactor = 2.0 * TAU / volume;
     let inv_four_alpha2 = 1.0 / (4.0 * params.alpha * params.alpha);
 
-    let mut phases: Vec<(f64, f64)> = vec![(0.0, 0.0); sites.len()];
-    for (g_index, g) in context.gvectors.iter().enumerate() {
-        let g = *g;
-        let g2 = g.norm2();
-        let amplitude = (-g2 * inv_four_alpha2).exp() / g2;
-        if amplitude == 0.0 {
-            continue;
-        }
-        // Structure factor S(G) = Σ_i q_i e^{iG·r_i}, kept as (Re, Im).
-        let (mut sre, mut sim) = (0.0, 0.0);
-        for (index, site) in sites.iter().enumerate() {
-            let (cos, sin) = context.phase(g_index, index, g, site.position);
-            sre += site.charge * cos;
-            sim += site.charge * sin;
-            phases[index] = (cos, sin);
-        }
+    // Each `G` is independent of every other, and this loop is where a periodic SCF spends most
+    // of its life: measured at 89–98% of every iteration across 6 to 72 atoms
+    // (`examples/periodic_profile.rs`, `PM3_GAMMA_PROFILE=1`). The isolated paths have been
+    // parallel since they were written; the periodic one never was.
+    //
+    // Split into a fixed number of contiguous chunks, mapped in parallel and **reduced in index
+    // order**, rather than a `par_iter().reduce()`. A rayon reduction combines partial sums in
+    // whatever order threads happen to finish, so the last bits of the energy would depend on
+    // the machine and on the run. Fixed chunks summed in order give the same answer every time,
+    // on any thread count, which is what the reproducibility tests hold this to and what makes
+    // a regression in the twelfth digit mean something.
+    use rayon::prelude::*;
 
-        let structure = sre * sre + sim * sim;
-        out.energy_ev += PM3_EV * prefactor * amplitude * structure;
+    let chunk = context
+        .gvectors
+        .len()
+        .div_ceil(rayon::current_num_threads().max(1) * 4)
+        .max(1);
+    let partials: Vec<Partial> = context
+        .gvectors
+        .par_chunks(chunk)
+        .enumerate()
+        .map(|(chunk_index, gs)| {
+            let mut partial = Partial::zeros(sites.len());
+            let mut phases: Vec<(f64, f64)> = vec![(0.0, 0.0); sites.len()];
+            for (offset, g) in gs.iter().enumerate() {
+                let g_index = chunk_index * chunk + offset;
+                let g = *g;
+                let g2 = g.norm2();
+                let amplitude = (-g2 * inv_four_alpha2).exp() / g2;
+                if amplitude == 0.0 {
+                    continue;
+                }
+                // Structure factor S(G) = Σ_i q_i e^{iG·r_i}, kept as (Re, Im).
+                let (mut sre, mut sim) = (0.0, 0.0);
+                for (index, site) in sites.iter().enumerate() {
+                    let (cos, sin) = context.phase(g_index, index, g, site.position);
+                    sre += site.charge * cos;
+                    sim += site.charge * sin;
+                    phases[index] = (cos, sin);
+                }
 
-        for (index, (cos, sin)) in phases.iter().enumerate() {
-            // Re[S(G) e^{−iG·r_i}] and Im[S(G) e^{−iG·r_i}].
-            let real = sre * cos + sim * sin;
-            let imaginary = sim * cos - sre * sin;
-            out.site_potential_ev[index] += PM3_EV * 2.0 * prefactor * amplitude * real;
-            out.site_gradient[index] +=
-                g * (PM3_EV * 2.0 * prefactor * amplitude * sites[index].charge * imaginary);
+                let structure = sre * sre + sim * sim;
+                partial.energy += PM3_EV * prefactor * amplitude * structure;
+
+                for (index, (cos, sin)) in phases.iter().enumerate() {
+                    // Re[S(G) e^{−iG·r_i}] and Im[S(G) e^{−iG·r_i}].
+                    let real = sre * cos + sim * sin;
+                    let imaginary = sim * cos - sre * sin;
+                    partial.potential[index] += PM3_EV * 2.0 * prefactor * amplitude * real;
+                    partial.gradient[index] += g
+                        * (PM3_EV * 2.0 * prefactor * amplitude * sites[index].charge * imaginary);
+                }
+
+                // ∂/∂ε_αβ of (1/V)·A(G)·|S|², with G → (1 − εᵀ)G and V → V(1 + tr ε), and G·r
+                // invariant so |S|² does not move:
+                //     [ 2 (1/4α² + 1/G²) G_α G_β − δ_αβ ] · (2π/V) A |S|²
+                let weight = PM3_EV * prefactor * amplitude * structure;
+                let scale = 2.0 * (inv_four_alpha2 + 1.0 / g2) * weight;
+                accumulate_outer(&mut partial.virial, g * scale, g);
+                for axis in 0..3 {
+                    add_diagonal(&mut partial.virial, axis, -weight);
+                }
+            }
+            partial
+        })
+        .collect();
+
+    for partial in partials {
+        out.energy_ev += partial.energy;
+        for (index, value) in partial.potential.iter().enumerate() {
+            out.site_potential_ev[index] += value;
         }
-
-        // ∂/∂ε_αβ of (1/V)·A(G)·|S|², with G → (1 − εᵀ)G and V → V(1 + tr ε), and G·r
-        // invariant so |S|² does not move:
-        //     [ 2 (1/4α² + 1/G²) G_α G_β − δ_αβ ] · (2π/V) A |S|²
-        let weight = PM3_EV * prefactor * amplitude * structure;
-        let scale = 2.0 * (inv_four_alpha2 + 1.0 / g2) * weight;
-        accumulate_outer(virial, g * scale, g);
+        for (index, value) in partial.gradient.iter().enumerate() {
+            out.site_gradient[index] += *value;
+        }
         for axis in 0..3 {
-            add_diagonal(virial, axis, -weight);
+            virial.col[axis] += partial.virial.col[axis];
+        }
+    }
+}
+
+/// One chunk's share of the reciprocal sum, summed into the total in chunk order.
+struct Partial {
+    energy: f64,
+    potential: Vec<f64>,
+    gradient: Vec<Vec3>,
+    virial: Mat3,
+}
+
+impl Partial {
+    fn zeros(n: usize) -> Self {
+        Self {
+            energy: 0.0,
+            potential: vec![0.0; n],
+            gradient: vec![Vec3::zero(); n],
+            virial: Mat3::zero(),
         }
     }
 }
@@ -1349,7 +1550,7 @@ fn direct_1d(
     // origin-dependent, so the formula below means nothing there. What is lost is the tail of the
     // *total*, which the three halves would otherwise have supplied between them — of order
     // `1e-6 eV` at the default image count, and the price of summing a divergent split with a
-    // common truncation. See [`crate::pbc::gamma::build_setup`].
+    // common truncation. See `pbc::gamma::build_setup`.
     // A charged chain, and the line charge that neutralizes it.
     //
     // The sum above diverges when `Q = Σq ≠ 0`: shell `n` contributes `Q²/(nL)` once the shell is

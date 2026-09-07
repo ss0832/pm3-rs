@@ -40,7 +40,7 @@
 //! * **1D** — direct summation, phased, keeping the chain path's no-splitting character. The
 //!   neutralizing line charge and the `1/n³` dipole tail are `q = 0` artefacts and appear only
 //!   where the phase is one; at `q ≠ 0` the oscillation itself is what converges the sum, and
-//!   the truncated tail is summed by repeated Abel transformation — see [`abel_tail`] for why
+//!   the truncated tail is summed by repeated Abel transformation — see `abel_tail` for why
 //!   the naive truncation would be `O(1/N)` there rather than `O(1/N³)`.
 //! * **0D** — the single `T = 0` term, with any `q` trivially phasing it by one.
 //!
@@ -496,7 +496,7 @@ fn phased_2d(
 /// is poorly conditioned.
 ///
 /// The repeated Abel transformation's optimal-truncation error goes as `e^{−N/|w|}` with
-/// `|w| = 1/(2|sin(q·a/2)|)` (see [`abel_tail`]), so the summed range is widened to keep
+/// `|w| = 1/(2|sin(q·a/2)|)` (see `abel_tail`), so the summed range is widened to keep
 /// `N/|w|` at least this large: at 40 the truncation floor is `~e^{−40} ≈ 4·10⁻¹⁸` relative,
 /// below everything else in this crate. The cost is linear in the extension and each term is a
 /// dozen floating-point operations, so this is cheap everywhere except within `~1/40` of a
@@ -527,7 +527,7 @@ const CHAIN_IMAGES_CEILING: usize = 100_000;
 ///   test could catch, because `Σ_n e^{iqnL}/(nL)` is finite while `Σ_n 1/(nL)` is what the
 ///   line charge exists to cancel. But the truncated tail is now `O(1/N)`, not `O(1/N³)`:
 ///   partial sums of `e^{iqnL}` are bounded by `1/(2|sin(qL/2)|)`, so Dirichlet gives
-///   convergence but not speed. [`abel_tail`] sums that tail by parts instead.
+///   convergence but not speed. `abel_tail` sums that tail by parts instead.
 fn phased_1d(
     cell: &Cell,
     displacements: &[Vec3],
@@ -647,13 +647,13 @@ fn phased_0d(displacements: &[Vec3], out: &mut [PhasedKernel]) {
     }
 }
 
-/// How many Abel orders [`abel_tail`] carries at most. Twenty is past the optimal truncation
+/// How many Abel orders `abel_tail` carries at most. Twenty is past the optimal truncation
 /// point everywhere the conditioning floor allows (`N/|w| ≥ 40` gives term twenty a relative
 /// size of `20!/40²¹ ≈ 5·10⁻¹⁶`), and the early-exit below stops sooner wherever the series
 /// turns first.
 const ABEL_ORDERS: usize = 20;
 
-/// One component ordering shared by [`abel_tail`] and its caller: value, the three gradient
+/// One component ordering shared by `abel_tail` and its caller: value, the three gradient
 /// components, then the nine Hessian entries row-major.
 type Bundle = [f64; 13];
 

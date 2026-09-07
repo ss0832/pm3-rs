@@ -291,25 +291,41 @@ impl ForceConstants {
     ///
     /// Check [`Self::acoustic_sum_rule_residual`] first. If it is not already small the force
     /// constants are wrong rather than rounded, and flattening it hides that.
+    /// The correction is **symmetrized before it is applied**. `Φ` is symmetric, and the raw
+    /// violation `C_a[α][β] = Σ_T Σ_b Φ_T[3a+α, 3b+β]` need not be symmetric in `αβ`, so
+    /// subtracting it as it stands leaves each on-site `3×3` block asymmetric. That would be
+    /// undone anyway — the dynamical matrix is Hermitized on the way to the frequencies, and
+    /// `symmetric_eigen` reads one triangle — so an asymmetric correction is half discarded by
+    /// whichever step comes next, silently. Subtracting `(C + Cᵀ)/2` keeps the block symmetric
+    /// and leaves behind only the antisymmetric part of a quantity that was rounding-sized to
+    /// begin with.
     pub fn enforce_acoustic_sum_rule(&mut self) {
-        let ndof = 3 * self.nat;
         let home = self
             .blocks
             .iter()
             .position(|(t, _)| *t == [0, 0, 0])
             .expect("the home cell is always present");
-        for row in 0..ndof {
-            for beta in 0..3 {
-                let mut total = 0.0;
-                for (_, block) in &self.blocks {
-                    for b in 0..self.nat {
-                        total += block[(row, 3 * b + beta)];
+        for atom in 0..self.nat {
+            let mut violation = [[0.0f64; 3]; 3];
+            for (alpha, row_of) in violation.iter_mut().enumerate() {
+                let row = 3 * atom + alpha;
+                for (beta, slot) in row_of.iter_mut().enumerate() {
+                    let mut total = 0.0;
+                    for (_, block) in &self.blocks {
+                        for b in 0..self.nat {
+                            total += block[(row, 3 * b + beta)];
+                        }
                     }
+                    *slot = total;
                 }
-                // All of it onto the diagonal self-term of the row's own atom, which is where a
-                // translation-invariant set would have put it.
-                let atom = row / 3;
-                self.blocks[home].1[(row, 3 * atom + beta)] -= total;
+            }
+            // All of it onto the diagonal self-term of the row's own atom, which is where a
+            // translation-invariant set would have put it — symmetrized, per the note above.
+            for (alpha, row_of) in violation.iter().enumerate() {
+                for (beta, value) in row_of.iter().enumerate() {
+                    let share = 0.5 * (value + violation[beta][alpha]);
+                    self.blocks[home].1[(3 * atom + alpha, 3 * atom + beta)] -= share;
+                }
             }
         }
     }

@@ -30,7 +30,12 @@
   translations and rotations projected out of the mass-weighted modes.
 - **Molden wavefunction output**: the raw ZDO coefficients, in MOPAC's own
   `VECTORS`/`GRAPHF` convention, over a Gaussian expansion of each Slater
-  function derived at run time rather than transcribed.
+  function derived at run time rather than transcribed. `[STO]` is available for
+  viewers that read it; `[GTO]` is the default because most do not.
+- **Orbital energies, coefficients and occupations**, with the frontier taken
+  across both spin channels and the coefficients labelled by atom and orbital.
+- **Phonon eigenvectors** alongside the frequencies: real at Γ, complex at a
+  wavevector.
 - PM3-D3, PM3-D3H4, and PM3-D3H4X classical post-SCF corrections, including
   their analytic gradient and Hessian contributions.
 - PM3 elements H-Ca, Zn-Sr, Cd-Ba, and Hg-Bi using the PM3 s/p basis.
@@ -103,6 +108,58 @@
 - A `pm3-rs` command installed by `pip`, backed by the same compiled CLI the
   standalone executable uses.
 
+## Where the model gives out, as opposed to the code
+
+> **Still provisional, for a different reason than before.** This section was
+> written while the meshed `D(q)` was known to be wrong, from the two routes not
+> affected by it — a second difference of the total energy and a first difference
+> of the analytic forces — plus Γ-point DFPT, verified against them. **That
+> defect is now fixed** (0.2.4; see [`pbc.md`](pbc.md)), so the mesh is no longer
+> the reason to doubt these numbers.
+>
+> What remains is the **geometry**. Every figure below is at the *experimental*
+> lattice constant, which is not PM3's equilibrium, and a Hessian evaluated off a
+> stationary point measures the displacement rather than the curvature of the
+> minimum. Such a figure cannot separate "PM3's lattice constant is off" from
+> "PM3's curvature is off". **Re-measure at relaxed geometries** before treating
+> the quantitative claims as settled — `examples/phonon_structures.rs` finds the
+> relaxed scale first, and is the way to do it. The qualitative claim — that PM3
+> was never fitted to a Madelung lattice and it shows in second derivatives — is
+> not in doubt either way.
+
+These are limits of PM3, not defects to fix here. They are listed because a
+result that is **computed correctly and physically wrong** is the most expensive
+kind to hand someone: nothing about the output says so.
+
+- **Phonons of ionic solids.** PM3 was fitted to molecular heats of formation,
+  geometries, dipoles and ionization potentials. Nothing in the
+  parameterization saw a Madelung lattice, and it shows in second derivatives.
+
+  Measured, at the experimental lattice constants, with three independent
+  routes agreeing (a second difference of the total energy, a first difference
+  of the analytic forces, and Γ-point DFPT):
+
+  | | PM3, Γ | experiment |
+  |---|---:|---:|
+  | NaCl, TO | **+217 cm⁻¹** | 164 cm⁻¹ |
+  | MgO, TO | **−1043 cm⁻¹** | +401 cm⁻¹ |
+
+  NaCl is about 30% high — the right order and the right sign, which is all a
+  molecular parameterization owes an ionic crystal. **MgO is qualitatively
+  wrong**: PM3 predicts that rocksalt MgO is unstable against the optical
+  distortion, and an energy scan with no derivative code in it agrees, dropping
+  170 meV when the sublattices are pushed 0.1 Å apart. The crystal is not
+  unstable; the model is.
+
+  Check a lattice-dynamics result against the structure being a minimum before
+  reading anything into it.
+
+- **Covalent semiconductors at their primitive cell.** Diamond and silicon —
+  the two crystals with the cleanest phonon measurements — do not reach a
+  phonon at all: the SCF stalls at the 200-iteration cap on the primitive cell
+  with a `3×3×3` mesh, at density residuals of `3.7e-5` and `5.5e-4` against a
+  `1e-7` tolerance. Stalls, not divergences.
+
 ## Out of scope
 
 - Genuine linear scaling. `DcOptions::long_range_cutoff` makes the near field
@@ -140,6 +197,32 @@ second exhaustive oracle covers all 42 ordinary PM3 elements, 15 La-Lu
 Sparkles, and `Cb`, `+`, and `-`. It compares energy, all gradient components,
 and every element of the Cartesian Hessian. Water gradient, optimized minimum,
 and harmonic frequencies are also checked.
+
+A third, broad oracle lives in `tests/data/mopac_oracle.tsv`: **189 molecules
+covering every element PM3 is parameterized for**, with MOPAC's heat of
+formation, dipole, net atomic charges and Koopmans ionization potential at each
+geometry. `tools/oracle/build_oracle_set.py` regenerates it and
+`tests/mopac_oracle.rs` reads it.
+
+**All 189 agree**, to better than `7.2e-4 kcal/mol` on the heat of formation,
+`1.1e-3 D` on the dipole and `1.6e-4 e` on the charges. Geometries are
+MOPAC-optimized except for species with nothing to optimize (noble-gas pairs,
+Sparkles, bare point charges), which the file marks in a `relaxed` column.
+
+Two things that set is there to catch, both found the first time it ran:
+
+- **A converged SCF is not necessarily the ground state.** Seven of the 189
+  reached an excited solution — self-consistent, obeying the aufbau principle
+  among its own eigenvalues, and up to 279 kcal/mol high. `ScfStability::Auto`
+  (the default since 0.2.5) re-solves from other starting points when the frontier
+  gap is small and keeps the lowest.
+- **MOPAC's default is not PM3.** MOPAC applies its `MMOK` amide correction unless
+  given `NOMM`. The oracle is generated with `NOMM`; pm3-rs defaults `mmok` off and
+  offers it as `method="pm3+mmok"` for reproducing a MOPAC default run.
+
+Francium is the one parameterized element absent from the set: its parameter row
+is all zeros, MOPAC answers `DATA ARE NOT AVAILABLE FOR ELEMENT NO. 87`, and
+pm3-rs refuses it as well.
 
 Current MOPAC v23.2.5 does not expose the historical PM3-D3/D3H4 method
 keywords. Correction coefficients are therefore source-verified against public
